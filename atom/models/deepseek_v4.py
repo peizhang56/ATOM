@@ -4529,6 +4529,12 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_base = atom_parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
 
+        # 1-based layer ids whose reconstructed residual is also returned, for
+        # EAGLE3 / DSpark / DFlash drafts that consume auxiliary hidden states.
+        # Empty by default; a draft sets it via
+        # `DeepseekV4ForCausalLM.set_aux_hidden_state_layers`.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+
     def forward(
         self,
         input_ids: torch.Tensor,  # [num_tokens] int  flat ragged-batch token ids
@@ -4540,6 +4546,13 @@ class DeepseekV4Model(nn.Module):
         reduction — `hc_head + RMSNorm + LM head` are all deferred to
         `compute_logits`. Returning the hc-shaped residual lets the (future)
         MTP draft consume it without re-expanding from a dim-reduced state.
+
+        When `aux_hidden_state_layers` is non-empty the return is instead
+        `(h, aux_hidden_states)`, where each aux entry is that layer's
+        reconstructed residual averaged over the hc streams — `[num_tokens,
+        dim]`. Same semantics as vLLM's own DSv4 target
+        (`vllm/models/deepseek_v4/amd/model.py`), which is what the DSpark
+        drafter's `combine_hidden_states` was trained against.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
         # PCP note: under PCP, `input_ids`/`positions` arrive already round-robin-
@@ -4553,12 +4566,41 @@ class DeepseekV4Model(nn.Module):
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         hc_state = HCState(residual=h, post_mix=None, comb_mix=None, x_prev=None)
 
-        for layer in self.layers:
+        aux_layers = self.aux_hidden_state_layers
+        if not aux_layers:
+            for layer in self.layers:
+                hc_state = layer(hc_state, positions)
+            h = self.layers[-1].hc_post(
+                hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
+            )
+            return h
+
+        # Aux path. `hc_post` is the deferred mHC reconstruction: after layer i
+        # runs, hc_state carries that layer's sub-layer output (`x_prev`), the
+        # pre-layer residual and the two mixing tensors, and hc_post turns them
+        # into the post-layer `[num_tokens, hc, dim]` residual. That is the
+        # tensor the aux consumer wants, averaged over hc.
+        aux_hidden_states: list[torch.Tensor] = []
+        final_aux_recon: torch.Tensor | None = None
+        for idx, layer in enumerate(self.layers):
             hc_state = layer(hc_state, positions)
-        h = self.layers[-1].hc_post(
-            hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
-        )
-        return h
+            if (idx + 1) in aux_layers:
+                final_aux_recon = layer.hc_post(
+                    hc_state.x_prev,
+                    hc_state.residual,
+                    hc_state.post_mix,
+                    hc_state.comb_mix,
+                )
+                aux_hidden_states.append(final_aux_recon.mean(dim=1))
+        if final_aux_recon is not None and len(self.layers) in aux_layers:
+            # Last layer was an aux layer — its reconstruction is the same
+            # tensor the tail below would recompute.
+            h = final_aux_recon
+        else:
+            h = self.layers[-1].hc_post(
+                hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
+            )
+        return h, aux_hidden_states
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -4757,6 +4799,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         else:
             ctx.context.input_ids = input_ids
         h = self.model(input_ids, positions)
+        # With aux hidden states configured the inner model returns
+        # `(h, aux_list)`. Carry the list alongside and re-attach on return so
+        # the PCP fixups below keep operating on a single tensor.
+        aux_hidden_states = None
+        if isinstance(h, tuple):
+            h, aux_hidden_states = h
 
         # ----- PCP: all-gather shards, restore original order, drop pad -----
         if use_pcp:
@@ -4769,7 +4817,39 @@ class DeepseekV4ForCausalLM(nn.Module):
                 h = pcp_allgather_rerange(h, pcp_size)
                 if pad > 0:
                     h = h[:n_global]
+                if aux_hidden_states is not None:
+                    aux_hidden_states = [
+                        pcp_allgather_rerange(a, pcp_size)[:n_global]
+                        if pad > 0
+                        else pcp_allgather_rerange(a, pcp_size)
+                        for a in aux_hidden_states
+                    ]
+        if aux_hidden_states is not None:
+            return h, aux_hidden_states
         return h
+
+    # ----- EAGLE3 / DSpark / DFlash auxiliary hidden states -----
+    #
+    # ATOM's server-mode convention: `set_aux_hidden_state_layers` +
+    # `get_eagle3_aux_hidden_state_layers`. The vLLM plugin wrapper
+    # (`atom/plugin/vllm/model_wrapper.py::_enable_eagle3_target_interface`)
+    # bridges these onto vLLM's `SupportsEagle3` surface.
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """`layers` are 1-based — layer id `i` means "after `self.layers[i-1]`",
+        matching vLLM's `(idx + 1) in aux_hidden_state_layers` convention."""
+        self.model.aux_hidden_state_layers = tuple(int(i) for i in layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # DSpark ships its target layer ids in the checkpoint config, 0-based;
+        # +1 converts to the 1-based convention above (same conversion vLLM's
+        # `get_eagle3_aux_layers_from_config` does).
+        for field in ("dspark_target_layer_ids", "target_layer_ids"):
+            ids = getattr(self.hf_config, field, None)
+            if ids:
+                return tuple(int(i) + 1 for i in ids)
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def compute_logits(
         self,

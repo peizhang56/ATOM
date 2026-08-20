@@ -91,6 +91,25 @@ class IndexerVllm(IndexerBase):
                 q_quant, weights, block_tables, indexer_meta, topk
             )  # [total_tokens, topk] int32
 
+        if num_decode_tokens >= q_quant.size(0):
+            # Every row went to the paged decode group, so the dense prefill
+            # slice is empty. `_score_topk_prefill` on zero rows chunks by a
+            # zero step (`range() arg 3 must not be zero`), so return the decode
+            # top-k alone. The split in the bridge keeps genuinely-prefilling
+            # rows out of the decode group, so reaching here means the batch was
+            # all decode rows in a prefill-classified step.
+            return self._score_topk_decode(
+                q_quant,
+                weights,
+                block_tables,
+                indexer_meta,
+                topk,
+                next_n=int(indexer_meta["decode_next_n"]),
+                n_committed_per_seq=indexer_meta["n_committed_per_seq_gpu"][
+                    : int(indexer_meta["num_decodes"])
+                ],
+            )
+
         num_decodes = int(indexer_meta["num_decodes"])
         n_committed_per_seq = indexer_meta["n_committed_per_seq_gpu"]
         # Decode rows: paged fixed-shape logits (bounded per-seq, no batch-sum).
@@ -376,11 +395,16 @@ class DeepseekV4ModelVllm(DeepseekV4ModelBase):
         )
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        h = super().forward(input_ids, positions)
+        out = super().forward(input_ids, positions)
+        # `(h, aux_hidden_states)` when an EAGLE3/DSpark draft configured aux
+        # layers; a bare tensor otherwise.
+        h, aux_hidden_states = out if isinstance(out, tuple) else (out, None)
         # In-graph copy_: captured into the CUDAGraph so it refreshes the buffer
         # on every replay, keeping the MTP draft's input hidden states current.
         num_tokens = h.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(h.flatten(1))
+        if aux_hidden_states is not None:
+            return h, aux_hidden_states
         return h
 
 

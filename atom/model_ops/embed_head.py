@@ -222,6 +222,33 @@ class ReplicatedEmbedding(nn.Module):
         return replicated_embedding(x, self.weight)
 
 
+class _UnquantizedHeadMethod:
+    """vLLM ``QuantizeMethodBase``-shaped shim so vLLM's ``LogitsProcessor`` can
+    drive an ATOM head.
+
+    vLLM calls ``lm_head.quant_method.apply(lm_head, hidden, bias=...)``
+    (``model_executor/layers/logits_processor.py:_apply_head``) and then does its
+    own TP gather and vocab-padding slice. So ``apply`` must be the LOCAL shard
+    GEMM only -- not ``ParallelLMHead.forward``, which all-gathers itself and
+    would double-gather.
+
+    Needed because vLLM's EAGLE3/DSpark loader shares the *target's* ``lm_head``
+    with the draft (``spec_decode/eagle/utils.py:_should_share``). Under the ATOM
+    plugin the target's head is this class rather than vLLM's ``ParallelLMHead``,
+    which carries a real ``quant_method``; without the shim the draft's first
+    ``compute_draft_logits`` dies with ``'ParallelHead' object has no attribute
+    'quant_method'``.
+    """
+
+    @staticmethod
+    def apply(
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return tgemm.mm(x, layer.weight, layer.bias if bias is None else bias)
+
+
 class ParallelLMHead(VocabParallelEmbedding):
 
     def __init__(
@@ -232,6 +259,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         **kwargs,
     ):
         super().__init__(num_embeddings, embedding_dim)
+        # Plain object, so nn.Module stores it in __dict__ rather than as a
+        # submodule. See _UnquantizedHeadMethod for why it exists.
+        self.quant_method = _UnquantizedHeadMethod()
         if bias:
             self.bias = atom_parameter(
                 torch.empty(self.num_embeddings_per_partition),
