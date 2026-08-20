@@ -165,6 +165,102 @@ def _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec) -> bool:
     return has_mla and has_non_mla_attn
 
 
+def _spec_is_v4_proxy_target_with_mla_draft(kv_cache_spec) -> bool:
+    """The DeepSeek-V4 topology, which is the mirror image of the EAGLE3 one
+    above: the *target* is ATOM's single opaque proxy layer (a FullAttentionSpec
+    of uint8 bytes -- ATOM owns the real MLA + indexer caches behind it) and the
+    *draft* is vLLM's own DSpark head, whose 3 `mtp.*` layers are genuine
+    (sliding-window) MLA.
+
+    `_spec_has_heterogeneous_mla_mha_backend` also matches this, but its splitter
+    would then rewrite the proxy's block size to ATOM's MHA block size and the
+    draft's to ATOM's MLA block size -- both wrong, because neither layer belongs
+    to the backend the name suggests. Handle it as its own case and keep every
+    spec's own block size.
+    """
+    try:
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+
+        from atom.plugin.vllm.deepseek_v4_bridge import (
+            ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+        )
+    except Exception:
+        return False
+
+    if ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME not in kv_cache_spec:
+        return False
+    draft = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if name != ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    }
+    # NB: SlidingWindowMLASpec is NOT a subclass of MLAAttentionSpec -- it
+    # derives from SlidingWindowSpec. DSpark's mtp layers produce the former.
+    return bool(draft) and all(
+        isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+        for spec in draft.values()
+    )
+
+
+def _groups_are_v4_proxy_plus_mla_draft(kv_cache_groups) -> bool:
+    """Recognise the pair built by `_build_v4_proxy_draft_kv_cache_groups` so the
+    shared-num_blocks allocator below is used for it too. Keyed on the proxy
+    layer name rather than on spec classes, because the draft's
+    SlidingWindowMLASpec does not subclass MLAAttentionSpec and so does not
+    satisfy `_groups_are_heterogeneous_mla_mha`.
+    """
+    try:
+        from atom.plugin.vllm.deepseek_v4_bridge import (
+            ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+        )
+    except Exception:
+        return False
+
+    if len(kv_cache_groups) != 2:
+        return False
+    return kv_cache_groups[0].layer_names == [ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME]
+
+
+def _build_v4_proxy_draft_kv_cache_groups(kv_cache_spec):
+    """Two pools, each keeping the block size its own backend asked for: ATOM's
+    proxy at ATOM_DEEPSEEK_V4_BLOCK_SIZE, the DSpark draft at whatever vLLM's MLA
+    backend picked. Unifying them is exactly what we must avoid -- the proxy's
+    page is a byte blob sized for ATOM's internal caches and does not survive a
+    block-size rewrite.
+    """
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec, UniformTypeKVCacheSpecs
+
+    from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    from atom.plugin.vllm.dspark_draft_kv_patch import convert_draft_specs
+
+    proxy_name = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    draft_specs = {
+        name: spec for name, spec in kv_cache_spec.items() if name != proxy_name
+    }
+    # Retype the DSpark draft's sliding-window specs so they route to a manager
+    # that abstains from the prefix cache. Without this the draft group caps the
+    # target's cache hit at whatever stale 3-block run survived eviction -- see
+    # dspark_draft_kv_patch for the full argument. A no-op for non-DSpark drafts.
+    draft_specs = convert_draft_specs(draft_specs)
+
+    proxy_group = KVCacheGroupSpec(
+        layer_names=[proxy_name],
+        kv_cache_spec=kv_cache_spec[proxy_name],
+    )
+    draft_uniform = UniformTypeKVCacheSpecs.from_specs(draft_specs)
+    assert draft_uniform is not None, (
+        "DSpark draft KV specs are not of a uniform type: "
+        f"{ {n: type(s).__name__ for n, s in draft_specs.items()} }"
+    )
+    draft_group = KVCacheGroupSpec(
+        layer_names=list(draft_specs.keys()),
+        kv_cache_spec=draft_uniform,
+    )
+    # proxy (non-MLA) first, draft (MLA) second -- `_groups_are_heterogeneous_mla_mha`
+    # accepts either order, so the shared allocator below picks both up.
+    return [proxy_group, draft_group]
+
+
 def _split_mla_and_mha_layers(kv_cache_spec):
     from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 
@@ -356,6 +452,16 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
 
     @functools.wraps(orig_get_groups)
     def patched_get_kv_cache_groups(vllm_config, kv_cache_spec):
+        logger.info(
+            "ATOM plugin: KV cache specs %s",
+            {name: type(spec).__name__ for name, spec in kv_cache_spec.items()},
+        )
+        if _spec_is_v4_proxy_target_with_mla_draft(kv_cache_spec):
+            logger.info(
+                "ATOM plugin: using heterogeneous KV cache layout - ATOM V4 proxy "
+                "target and vLLM MLA draft - with separate per-group pools."
+            )
+            return _build_v4_proxy_draft_kv_cache_groups(kv_cache_spec)
         if getattr(
             vllm_config.model_config, "use_mla", False
         ) and _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec):
@@ -370,7 +476,9 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
     def patched_get_kv_cache_config_from_groups(
         vllm_config, kv_cache_groups, available_memory
     ):
-        if _groups_are_heterogeneous_mla_mha(kv_cache_groups):
+        if _groups_are_heterogeneous_mla_mha(
+            kv_cache_groups
+        ) or _groups_are_v4_proxy_plus_mla_draft(kv_cache_groups):
             return _build_heterogeneous_kv_cache_config_from_groups(
                 vllm_config, kv_cache_groups, available_memory
             )
@@ -378,7 +486,9 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
 
     @functools.wraps(orig_max_mem)
     def patched_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups):
-        if _groups_are_heterogeneous_mla_mha(kv_cache_groups):
+        if _groups_are_heterogeneous_mla_mha(
+            kv_cache_groups
+        ) or _groups_are_v4_proxy_plus_mla_draft(kv_cache_groups):
             return _heterogeneous_max_memory_usage_bytes(vllm_config, kv_cache_groups)
         return orig_max_mem(vllm_config, kv_cache_groups)
 
