@@ -532,7 +532,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self._enable_eagle3_target_interface()
         if self.is_mtp:
             self.get_mtp_target_hidden_states = self._get_mtp_target_hidden_states
-        if self.is_mtp or self.is_eagle3:
+        if self.is_mtp or self.is_eagle3 or self.is_dspark:
             # Mirror nested attributes required by vLLM speculative decoding.
             self._expose_spec_decode_attrs()
 
@@ -644,6 +644,15 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if inner is not None:
             if not hasattr(model, "embedding") and hasattr(inner, "embed"):
                 put(model, "embedding", inner.embed)
+            # The DSpark/DFlash draft loaders alias the target embedding too, but
+            # look it up under `embed_tokens`: dflash falls back to `embedding`,
+            # dspark (v1/worker/gpu/spec_decode/dspark/utils.py) does not. Without
+            # this name the alias silently no-ops and the draft keeps its own
+            # embedding, which the checkpoint never fills because the draft
+            # declares `has_own_embed_tokens = False` -- i.e. it drafts off an
+            # all-zero table. Expose both names.
+            if not hasattr(model, "embed_tokens") and hasattr(inner, "embed"):
+                put(model, "embed_tokens", inner.embed)
             if not hasattr(model, "lm_head") and hasattr(inner, "head"):
                 put(model, "lm_head", inner.head)
 
@@ -1008,7 +1017,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     )
                 else:
                     hidden_states = self.model(input_ids=input_ids, positions=positions)
-                    self._mtp_target_hidden_states = hidden_states
+                    if isinstance(hidden_states, tuple):
+                        # EAGLE3 / DSpark / DFlash: `(hidden, aux_list)`. vLLM's
+                        # runner unpacks the pair itself, so pass it straight
+                        # through — but the MTP hidden-state cache wants the
+                        # plain residual stack, not the pair.
+                        self._mtp_target_hidden_states = hidden_states[0]
+                    else:
+                        self._mtp_target_hidden_states = hidden_states
         else:
             if (
                 self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}
