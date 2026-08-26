@@ -610,12 +610,6 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
                     capturing,
                 )
             return common_attn_metadata
-        if capturing:
-            _synthesize_v4_capture_context(common_attn_metadata, meta_params)
-        slot_allocator = (
-            None if capturing else getattr(model, "_atom_v4_slot_allocator", None)
-        )
-        decode_bufs = getattr(model, "_atom_v4_decode_bufs", None)
         # Batch-ordered req_ids exposed by the ATOM vLLM patch for this step;
         # used as the host-resident state-slot key (no block-table D2H). None
         # when the patch isn't applied (standalone/tests) -> build falls back.
@@ -629,6 +623,38 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
                 req_ids = get_current_req_ids()
             except Exception:
                 req_ids = None
+        # vLLM's RUNTIME dummy batch is the same degenerate synthetic decode
+        # batch as a capture batch and needs the same repair, but it arrives
+        # through the ordinary ``build()`` (``capturing`` False), so the
+        # capture-only repair below used to skip it.
+        #
+        # Where it comes from: with ``--data-parallel-size > 1`` an idle DP rank
+        # must keep stepping in lockstep with the busy ranks, so the engine core
+        # calls ``execute_dummy_batch()`` ("Execute a dummy pass when no ready
+        # requests ran", vllm/v1/engine/core.py) -> ``_dummy_run(
+        # uniform_decode=True)`` -> ``execute_model(dummy_run=True)`` over a
+        # fabricated ``_dummy_req_N`` whose ``seq_len == query_len`` with no
+        # committed KV. Nothing calls that at runtime without DP, which is why
+        # plain TP and 8-separate-replica deployments never hit it.
+        #
+        # ``req_ids == []`` is precisely vLLM's "batch with no real requests"
+        # signal (``req_id_passthrough_patch.get_current_req_ids``) -- the same
+        # signal the state-slot branch in the builder already uses to tell a
+        # synthetic batch from a real one. Gate on decode shape as well so a
+        # prefill-shaped profiling dummy, which already carries a coherent
+        # context, is left alone.
+        max_q = int(getattr(common_attn_metadata, "max_query_len", 0) or 0)
+        is_dummy_decode = (
+            req_ids is not None
+            and len(req_ids) == 0
+            and 0 < max_q <= 1 + int(self._num_spec_tokens)
+        )
+        if capturing or is_dummy_decode:
+            _synthesize_v4_capture_context(common_attn_metadata, meta_params)
+        slot_allocator = (
+            None if capturing else getattr(model, "_atom_v4_slot_allocator", None)
+        )
+        decode_bufs = getattr(model, "_atom_v4_decode_bufs", None)
         md = build_atom_v4_attention_metadata(
             common_attn_metadata,
             meta_params=meta_params,
