@@ -14,7 +14,7 @@ from torch import nn
 from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
-from atom.utils import envs
+from atom.utils import envs, oob_probe as _oob_probe
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
 
@@ -167,6 +167,13 @@ class VocabParallelEmbedding(nn.Module):
 
     @mark_trace
     def forward(self, x: torch.Tensor):
+        # Probe (off unless ATOM_OOB_PROBE=1): is the async-spec-decode `-1`
+        # placeholder actually reaching this gather, and at which tp_size?
+        # Placed before the branch so both are measured on one scale.
+        if _oob_probe.ENABLED:
+            _oob_probe.count(
+                f"vocab_embed_tp{self.tp_size}", x, 0, self.num_embeddings
+            )
         # Torch compile will make logical_and, mask, embedding in a fused triton kernel, but make accuracy issue in MTP.
         if self.tp_size > 1:
             y = masked_embedding(

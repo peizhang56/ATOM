@@ -2,6 +2,7 @@ import functools
 import logging
 
 from atom.utils import envs
+from atom.utils import oob_probe as _oob_probe
 
 logger = logging.getLogger("atom")
 
@@ -158,6 +159,8 @@ def _patch_dspark_markov_embed_bounds() -> None:
         if limit is None:
             limit = self.model.markov_head.markov_w1.num_embeddings
             self._atom_markov_num_rows = limit
+        if _oob_probe.ENABLED:
+            _oob_probe.count("markov_embed", token_ids, 0, limit)
         # Out-of-place: `prev` is the caller's live loop variable.
         return original_markov_embed(self, token_ids.clamp(0, limit - 1))
 
