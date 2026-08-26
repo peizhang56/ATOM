@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -955,13 +956,32 @@ class _V4DecodeMetaBuffers:
         # tears the staging buffers and the queue takes a memory access fault.
         self._h2d_gate_enabled = os.environ.get("ATOM_V4_H2D_GATE", "1") != "0"
         self._h2d_done = torch.cuda.Event()
+        # ATOM_V4_H2D_GATE_STATS=1 measures what the depth-1 gate actually costs:
+        # how long the host sits in `synchronize()` versus how long it spends
+        # between gates doing useful work. The concern it answers is whether a
+        # depth-1 gate caps the CPU run-ahead that `--async-scheduling` exists to
+        # create. Off by default; two `perf_counter` calls per decode build.
+        self._h2d_gate_stats = os.environ.get("ATOM_V4_H2D_GATE_STATS", "0") == "1"
+        # A c32 pack point is only ~1k decode builds, so report often enough
+        # that a short run still emits several lines.
+        self._gate_stats_every = int(
+            os.environ.get("ATOM_V4_H2D_GATE_STATS_EVERY", "200")
+        )
+        self._gate_calls = 0
+        self._gate_blocked_ns = 0
+        self._gate_span_ns = 0
+        self._gate_blocked_max_ns = 0
+        self._gate_prev_end = None
         logger.info(
-            "V4 decode staging: depth-1 H2D reuse gate %s",
+            "V4 decode staging: depth-1 H2D reuse gate %s (stats %s)",
             (
                 "active (pinned host buffers cannot be rewritten mid-DMA)"
                 if self._h2d_gate_enabled
                 else "DISABLED via ATOM_V4_H2D_GATE=0 -- async scheduling will fault"
             ),
+            f"on, every {self._gate_stats_every} builds"
+            if self._h2d_gate_stats
+            else "off",
         )
         self.plan_buffers: dict[int, dict] = {}
         for ratio, is_overlap in ratios_overlap:
@@ -1013,8 +1033,36 @@ class _V4DecodeMetaBuffers:
         are illegal inside a capture region, and capture is a single-threaded
         warmup with no CPU run-ahead to guard against.
         """
-        if self._h2d_gate_enabled and not torch.cuda.is_current_stream_capturing():
+        if not self._h2d_gate_enabled or torch.cuda.is_current_stream_capturing():
+            return
+        if not self._h2d_gate_stats:
             self._h2d_done.synchronize()
+            return
+        t0 = time.perf_counter_ns()
+        self._h2d_done.synchronize()
+        t1 = time.perf_counter_ns()
+        blocked = t1 - t0
+        self._gate_blocked_ns += blocked
+        if blocked > self._gate_blocked_max_ns:
+            self._gate_blocked_max_ns = blocked
+        if self._gate_prev_end is not None:
+            # Wall time since the previous gate returned: this build's own
+            # host-side work plus everything vLLM did between the two builds.
+            self._gate_span_ns += t0 - self._gate_prev_end
+        self._gate_prev_end = t1
+        self._gate_calls += 1
+        if self._gate_calls % self._gate_stats_every == 0:
+            total = self._gate_span_ns + self._gate_blocked_ns
+            logger.info(
+                "V4 H2D gate stats: %d builds | blocked %.3f s (%.2f%% of the "
+                "%.3f s host span) | mean %.1f us | max %.1f us",
+                self._gate_calls,
+                self._gate_blocked_ns / 1e9,
+                100.0 * self._gate_blocked_ns / max(1, total),
+                total / 1e9,
+                self._gate_blocked_ns / 1e3 / max(1, self._gate_calls),
+                self._gate_blocked_max_ns / 1e3,
+            )
 
     def mark_h2d_enqueued(self):
         """Close the window ``gate_staging_reuse`` waits on. Called once, after
