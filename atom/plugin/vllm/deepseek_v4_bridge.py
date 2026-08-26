@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -944,6 +945,24 @@ class _V4DecodeMetaBuffers:
         # (padded decode batch); max_q_len == 1 + max_spec_steps.
         self.decode_graph_bs = S
         self.decode_q_len = max(1, T // S)
+        # Marks completion of the previous build's staging H2Ds. See
+        # `gate_staging_reuse`. Never-recorded events synchronize immediately,
+        # so the first build is unthrottled.
+        # ATOM_V4_H2D_GATE=0 disables the gate. Present so the gate can be A/B'd
+        # -- for its throughput cost, and to re-expose the fault it closes when
+        # investigating whether other async-path bugs share its root cause.
+        # Never set it in a served config: without the gate, `--async-scheduling`
+        # tears the staging buffers and the queue takes a memory access fault.
+        self._h2d_gate_enabled = os.environ.get("ATOM_V4_H2D_GATE", "1") != "0"
+        self._h2d_done = torch.cuda.Event()
+        logger.info(
+            "V4 decode staging: depth-1 H2D reuse gate %s",
+            (
+                "active (pinned host buffers cannot be rewritten mid-DMA)"
+                if self._h2d_gate_enabled
+                else "DISABLED via ATOM_V4_H2D_GATE=0 -- async scheduling will fault"
+            ),
+        )
         self.plan_buffers: dict[int, dict] = {}
         for ratio, is_overlap in ratios_overlap:
             ratio = int(ratio)
@@ -953,6 +972,56 @@ class _V4DecodeMetaBuffers:
                 "compress": i32(cap, 4),
                 "write": i32(max(1, T), 4),
             }
+
+    def gate_staging_reuse(self):
+        """Block until the previous build's staging H2Ds have executed.
+
+        ``stage`` / ``CpuGpuBuffer.copy_to_gpu`` copy ``non_blocking=True`` out
+        of ONE pinned host buffer per name, and there is exactly one
+        ``_V4DecodeMetaBuffers`` per model. Stream ordering protects the GPU
+        side of the copy; it does not protect the pinned HOST side from being
+        rewritten before the DMA has read it. So the next build's
+        ``buf.np[:n] = arr`` races the previous build's DMA.
+
+        Without async scheduling the race is closed by accident: vLLM
+        synchronizes to read the sampled token ids before it builds the next
+        step's metadata, which drains the copies. ``--async-scheduling`` removes
+        exactly that sync, letting the CPU run a step ahead, and the host
+        buffers are then rewritten mid-DMA.
+
+        Observed (TP1, async ON, DSpark K=5, ~200 in-flight requests): the
+        ``kv_indptr`` handed to aiter's ``mla_decode_fwd_v4_nm`` came back
+        NON-MONOTONIC at index 192 with a segment length of -147. A merely
+        stale buffer would still hold a valid monotonic cumsum; a cumsum that
+        goes backwards at one request boundary can only be two different
+        cumsums torn together in one buffer. 192/198/204 are 32/33/34 requests
+        x (1 + K) -- the tear lands on request boundaries because that is the
+        granularity the two builds differ by. The kernel then walks
+        ``kv_page_indices[kv_indptr[s] : kv_indptr[s+1]]`` with a negative
+        span, addresses ``kv_packed`` at garbage page ids, and the queue takes
+        a `Memory access fault ... Reason: Unknown`.
+
+        One host buffer admits one build of lead, so the gate is depth-1 -- the
+        same shape as native ATOM's ``model_runner._gate_staging_reuse``, which
+        the vLLM bridge never inherited because it mirrors ``forward_vars``
+        rather than reusing it. The wait is a no-op in steady state: the event
+        was recorded a full step earlier, before that step's model kernels were
+        even enqueued, so it has long completed. A never-recorded event passes
+        immediately, so the first build is not held.
+
+        Skipped while a CUDA/HIP graph is capturing: event record/synchronize
+        are illegal inside a capture region, and capture is a single-threaded
+        warmup with no CPU run-ahead to guard against.
+        """
+        if self._h2d_gate_enabled and not torch.cuda.is_current_stream_capturing():
+            self._h2d_done.synchronize()
+
+    def mark_h2d_enqueued(self):
+        """Close the window ``gate_staging_reuse`` waits on. Called once, after
+        the last ``stage`` / ``copy_to_gpu`` of a build, so one event covers
+        them all."""
+        if self._h2d_gate_enabled and not torch.cuda.is_current_stream_capturing():
+            self._h2d_done.record()
 
     def stage(self, buf, arr_np):
         """Copy ``arr_np`` into the head of CpuGpuBuffer ``buf`` and return the
@@ -1559,6 +1628,9 @@ def build_atom_v4_attention_metadata(
 
     if decode_persistent:
         bufs = decode_bufs
+        # Make the pinned host staging buffers safe to overwrite before the
+        # first `bufs.stage(...)` below writes them.
+        bufs.gate_staging_reuse()
         md.state_slot_out_cpu = physical_slot_arr
         md.state_slot_out = bufs.stage(bufs.state_slot_out, physical_slot_arr)
         md.state_slot_in = bufs.stage(bufs.state_slot_in, physical_slot_arr)
@@ -1649,6 +1721,8 @@ def build_atom_v4_attention_metadata(
             md.qo_indptr = bufs.qo_indptr.copy_to_gpu(T_pad + 1)
             bufs.kv_last_page_lens.np[:T_pad] = 1
             md.kv_last_page_lens = bufs.kv_last_page_lens.copy_to_gpu(T_pad)
+        # Last staging copy of this build is enqueued; one event covers them all.
+        bufs.mark_h2d_enqueued()
         return md
 
     # ---- eager path: prefill, or decode without persistent buffers ----
