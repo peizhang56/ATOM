@@ -174,7 +174,13 @@ class VocabParallelEmbedding(nn.Module):
             )
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         else:
-            y = F.embedding(x, self.weight)
+            # Not a raw F.embedding: that has no bounds check, and under async
+            # scheduling input_ids transiently carries the scheduler's -1 spec
+            # placeholder, which reads below the table and GPU-faults (0x1016) --
+            # the same hazard replicated_embedding() documents above. Masked
+            # returns zeros out of range, bit-identical otherwise. Only
+            # tp_size == 1 was exposed; the branch above already bounds-checks.
+            y = replicated_embedding(x, self.weight)
         return y
         # if self.tp_size > 1:
         #     mask = torch.logical_and(x >= self.vocab_start_idx, x < self.vocab_end_idx)

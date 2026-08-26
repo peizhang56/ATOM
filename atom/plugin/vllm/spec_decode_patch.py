@@ -127,6 +127,48 @@ def _patch_dspark_fused_markov_sample() -> None:
     )
 
 
+def _patch_dspark_markov_embed_bounds() -> None:
+    """Bounds-check the DSpark Markov embedding gather.
+
+    ``markov_w1`` is a bare ``nn.Embedding`` (``qwen3_dspark.py``), so
+    ``markov_embed`` is an unguarded ``F.embedding``. Under async scheduling the
+    ids can carry the scheduler's ``-1`` spec placeholder, which reads off the
+    ``[V, r]`` table and GPU-faults (0x1016).
+
+    Clamped at the point of use: ``_sample_sequential`` reassigns ``prev`` on
+    every one of the K steps, so sanitising only the seed leaves K-1 gathers
+    exposed. No accuracy cost -- the target verifies every draft token, so a bad
+    draft costs acceptance, not output.
+
+    ATOM's fused ``markov_argmax`` path indexes inside its kernel and is
+    greedy-only, so it is unreachable here and left alone.
+    """
+    try:
+        from vllm.models.deepseek_v4.amd.dspark import DSparkDeepseekV4ForCausalLM
+    except ImportError:
+        return
+
+    original_markov_embed = DSparkDeepseekV4ForCausalLM.markov_embed
+    if getattr(original_markov_embed, "_atom_markov_bounds_patched", False):
+        return
+
+    @functools.wraps(original_markov_embed)
+    def markov_embed(self, token_ids: "torch.Tensor") -> "torch.Tensor":
+        limit = getattr(self, "_atom_markov_num_rows", None)
+        if limit is None:
+            limit = self.model.markov_head.markov_w1.num_embeddings
+            self._atom_markov_num_rows = limit
+        # Out-of-place: `prev` is the caller's live loop variable.
+        return original_markov_embed(self, token_ids.clamp(0, limit - 1))
+
+    markov_embed._atom_markov_bounds_patched = True
+    DSparkDeepseekV4ForCausalLM.markov_embed = markov_embed
+    logger.info(
+        "ATOM plugin: bounds-checking the DSpark Markov embedding gather "
+        "(an out-of-range draft id would fault the GPU under async scheduling)."
+    )
+
+
 def _get_attn_backend_block_size(backend) -> int:
     supported = backend.get_supported_kernel_block_sizes()
     get_preferred = getattr(backend, "get_preferred_block_size", None)
@@ -736,6 +778,7 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
     _patch_dspark_fused_markov_sample()
+    _patch_dspark_markov_embed_bounds()
     _patch_vllm_llm_base_model_sharing()
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()
