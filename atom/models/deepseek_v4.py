@@ -4819,9 +4819,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                     h = h[:n_global]
                 if aux_hidden_states is not None:
                     aux_hidden_states = [
-                        pcp_allgather_rerange(a, pcp_size)[:n_global]
-                        if pad > 0
-                        else pcp_allgather_rerange(a, pcp_size)
+                        (
+                            pcp_allgather_rerange(a, pcp_size)[:n_global]
+                            if pad > 0
+                            else pcp_allgather_rerange(a, pcp_size)
+                        )
                         for a in aux_hidden_states
                     ]
         if aux_hidden_states is not None:
@@ -4844,8 +4846,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         # DSpark ships its target layer ids in the checkpoint config, 0-based;
         # +1 converts to the 1-based convention above (same conversion vLLM's
         # `get_eagle3_aux_layers_from_config` does).
-        for field in ("dspark_target_layer_ids", "target_layer_ids"):
-            ids = getattr(self.hf_config, field, None)
+        for attr in ("dspark_target_layer_ids", "target_layer_ids"):
+            ids = getattr(self.hf_config, attr, None)
             if ids:
                 return tuple(int(i) + 1 for i in ids)
         num_layers = len(self.model.layers)

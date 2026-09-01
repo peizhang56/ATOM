@@ -48,7 +48,12 @@ def count(tag: str, ids: torch.Tensor, lo: int, hi: int) -> None:
             logger.info(
                 "OOB probe [%s]: %d / %d ids out of [%d, %d) over %d calls "
                 "(%.4f%% of ids; range floor was %s)",
-                tag, n_oob, n_tot, lo, hi, _calls[tag],
+                tag,
+                n_oob,
+                n_tot,
+                lo,
+                hi,
+                _calls[tag],
                 100.0 * n_oob / max(1, n_tot),
                 int(ids.min()) if n_oob else "n/a",
             )
