@@ -2386,8 +2386,19 @@ def atom_deepseek_v4_forward_context(
         # The rows this forward really runs -- what MoE will be handed.
         scheduled_tokens=int(input_ids.shape[0]) if input_ids is not None else 0,
         running_bs=batch_size,
+        # `attn_metadata` on the force_dummy path is the profile stub built
+        # above -- `state` and `in_hipgraph` and nothing else. It carries no
+        # attention geometry, so it cannot answer `max_seqlen_q`, and
+        # `is_prefill` is pinned False three lines up whenever force_dummy is
+        # set, which puts the stub straight down the decode branch of
+        # running_tokens_from_bs(). Say "no metadata" rather than hand it a
+        # stub: that is what the stub means, and it is the case the helper
+        # already documents. Passing it through raises AttributeError and kills
+        # the worker during profile_run.
         running_tokens=running_tokens_from_bs(
-            batch_size, is_prefill=is_prefill, attn_metadata=attn_metadata
+            batch_size,
+            is_prefill=is_prefill,
+            attn_metadata=None if force_dummy else attn_metadata,
         ),
         input_ids=input_ids,
     )
