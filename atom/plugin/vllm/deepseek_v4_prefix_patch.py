@@ -213,6 +213,12 @@ def _drop_swa_warmup_blocks(
     the max across groups, a short draft hit could over-subtract and clamp an
     otherwise good hit to zero.
     """
+    # Imported here, not at module scope, for the same reason the installer
+    # below does it: atom.plugin.vllm.deepseek_v4_bridge imports back into this
+    # package. Without it this name is simply unbound in this function and the
+    # fallback below raises NameError.
+    from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_BLOCK_SIZE
+
     if num_computed_tokens <= 0 or warmup_tokens <= 0:
         return computed_blocks, num_computed_tokens, shared_prefix_boundary
 
@@ -228,9 +234,7 @@ def _drop_swa_warmup_blocks(
     for idx, group in enumerate(groups):
         block_list = list(group)
         block_size = (
-            block_sizes[idx]
-            if idx < len(block_sizes)
-            else ATOM_DEEPSEEK_V4_BLOCK_SIZE
+            block_sizes[idx] if idx < len(block_sizes) else ATOM_DEEPSEEK_V4_BLOCK_SIZE
         )
         keep = min(len(block_list), new_num_computed_tokens // block_size)
         if keep != len(block_list):
@@ -384,7 +388,7 @@ def apply_vllm_v4_profiling_min_blocks_patch(vllm_config=None) -> None:
     # without also resizing the metadata builders the same call constructs.
     # Intercept the one thing that carries the count instead: the KVCacheConfig
     # the original builds, scaling each tensor to `floor` blocks.
-    import vllm.v1.core.kv_cache_utils as kv_cache_utils
+    from vllm.v1.core import kv_cache_utils
 
     @functools.wraps(original)
     def wrapped_init_minimal_kv_cache_for_profiling(self):
@@ -418,7 +422,9 @@ def apply_vllm_v4_profiling_min_blocks_patch(vllm_config=None) -> None:
     logger.info(
         "ATOM DeepSeek-V4: cudagraph-profiling KV cache floor installed "
         "(%s; the proxy page amortizes the SWA ring over exactly that many).",
-        f"{_floor_for(vllm_config)} blocks"
-        if vllm_config is not None
-        else "resolved per model runner",
+        (
+            f"{_floor_for(vllm_config)} blocks"
+            if vllm_config is not None
+            else "resolved per model runner"
+        ),
     )
