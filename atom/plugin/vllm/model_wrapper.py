@@ -366,6 +366,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.is_mtp = False
         self.is_eagle3 = False
         self.is_dspark = False
+        self.is_dflash = False
         self._mtp_target_hidden_states = None
         speculative_config = getattr(vllm_config, "speculative_config", None)
         if speculative_config is not None:
@@ -373,6 +374,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self.is_mtp = spec_method == "mtp"
             self.is_eagle3 = spec_method == "eagle3"
             self.is_dspark = spec_method == "dspark"
+            # vLLM groups dflash with the aux-hidden-state methods
+            # (config/speculative.py:935) and so requires the TARGET to satisfy
+            # SupportsEagle3. The draft itself needs nothing from ATOM: its arch
+            # DFlash2DraftModel is absent from _VLLM_MODEL_REGISTRY_OVERRIDES,
+            # so vLLM builds it from qwen3_dflash2 natively.
+            self.is_dflash = spec_method == "dflash"
 
         main_model_arch = vllm_config.model_config.architectures[0]
         selected_model_arch = _select_model_arch(vllm_config)
@@ -533,17 +540,30 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self._enable_mtp_input_masking_for_vllm()
         if self.is_eagle3_draft_model:
             self._enable_eagle3_draft_interface()
-        elif (self.is_eagle3 and self._eagle3_uses_aux_hidden_state()) or (
-            # DSpark targets are tapped through the same SupportsEagle3 surface.
-            self.is_dspark
-            and not self.is_dspark_draft_model
+        elif (
+            (self.is_eagle3 and self._eagle3_uses_aux_hidden_state())
+            or (
+                # DSpark targets are tapped through the same SupportsEagle3 surface.
+                self.is_dspark
+                and not self.is_dspark_draft_model
+            )
+            # So are DFlash targets. No draft-model exclusion here: the DFlash
+            # draft is never built through this wrapper (see is_dflash above).
+            or self.is_dflash
         ):
             self._enable_eagle3_target_interface()
         if self.is_mtp:
             self.get_mtp_target_hidden_states = self._get_mtp_target_hidden_states
-        if self.is_mtp or self.is_eagle3:
+        if self.is_mtp or self.is_eagle3 or self.is_dflash:
             # Mirror nested attributes required by vLLM speculative decoding.
             self._expose_spec_decode_attrs()
+        if self.is_dflash:
+            # A DFlash draft ships no head: vLLM rebinds ours onto it
+            # (spec_decode/dflash/utils.py:83) and then drives it through its
+            # own lm_head protocol instead of our forward().
+            head = getattr(self, "lm_head", None)
+            if hasattr(head, "enable_vllm_head_protocol"):
+                head.enable_vllm_head_protocol()
 
         # For sparse MLA, register the Indexer's DeepseekV32IndexerCache as
         # a virtual subclass of vLLM's AttentionLayerBase so vLLM can discover

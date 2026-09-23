@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -251,6 +253,45 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
+
+    def enable_vllm_head_protocol(self) -> None:
+        """Expose the attributes vLLM's LogitsProcessor reads off an lm_head.
+
+        A DFlash draft ships no head of its own (GLM-5.3-DFlash2 is 96 tensors
+        with no lm_head and no embed_tokens), so vLLM rebinds the *target's*
+        head onto the draft -- spec_decode/dflash/utils.py:83 -- and then drives
+        it through its own protocol rather than through `forward`:
+
+            lm_head.quant_method.apply(lm_head, hidden, bias=...)
+            lm_head.shard_indices.{org_vocab_start_index, num_org_vocab_padding}
+            lm_head.tp_size                               # already ours
+
+        The contract differs from `forward` in one way that matters: `apply`
+        must return SHARD-LOCAL logits. vLLM all-gathers the top-k values and
+        ids itself (logits_processor.py:275), so gathering here as `forward`
+        does would double-gather and put the vocab offset on the wrong axis.
+        """
+        if getattr(self, "quant_method", None) is not None:
+            return
+
+        class _ShardedHeadGemm:
+            """vLLM's quant-method protocol over ATOM's sharded head GEMM."""
+
+            @staticmethod
+            def apply(layer, x: torch.Tensor, bias: torch.Tensor | None = None):
+                # No all-gather: the caller owns the vocab-parallel reduction.
+                if bias is None:
+                    bias = layer.bias
+                return tgemm.mm(x, layer.weight, bias)
+
+        # num_embeddings % tp_size == 0 is asserted in __init__, so this head is
+        # never vocab-padded and the org_* indices are just the shard bounds.
+        self.shard_indices = SimpleNamespace(
+            org_vocab_start_index=self.vocab_start_idx,
+            org_vocab_end_index=self.vocab_end_idx,
+            num_org_vocab_padding=0,
+        )
+        self.quant_method = _ShardedHeadGemm()
 
     def forward(self, x: torch.Tensor):
         if not is_plugin_mode():
