@@ -408,6 +408,25 @@ def sparse_attn_indexer_plugin_mode(
                     weights=weights[q_start:q_end],
                     cu_starts=row_ks,
                     cu_ends=row_ke,
+                    # The -inf prefill of this buffer has no reader, so skip it
+                    # (the native paths already do: deepseek_v2.py:1863,
+                    # deepseek_v4.py:1869). It exists so a position outside a
+                    # row's window cannot win the top-k, but
+                    # top_k_per_row_prefill below is handed the SAME row_ks /
+                    # row_ke and offsets every access by rowStart, bounded by
+                    # rowEnd, so it never looks outside the window
+                    # (vllm/csrc/libtorch_stable/sampler.cu:556). The logits
+                    # kernel writes every column in [row_ks, row_ke), and
+                    # clean_logits=False only relaxes the PER-ROW store mask --
+                    # the union bound that keeps the store inside the row stays
+                    # -- so every value top-k can read is unchanged.
+                    #
+                    # It is not free to skip: torch.full(-inf) covers the whole
+                    # [rows, committed] plane, which is ~3x the block-diagonal
+                    # band the logits kernel actually writes. Measured 420-467 us
+                    # per call at all six traced shapes, ~94 calls/step, 4.97 %
+                    # of prefill GPU time at ISL 120k / --cache 90 / CONC 24.
+                    clean_logits=False,
                 )
                 num_rows = logits.shape[0]
                 topk_indices_prefill = topk_indices[q_start:q_end, :topk_tokens]
