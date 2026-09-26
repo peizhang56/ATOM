@@ -50,13 +50,55 @@ _SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 # (bench_indexer_allgather.py) that a small slice cannot earn back. 256 rows is
 # the measured crossover with margin -- at 128 rows the split still wins, but by
 # less than the run-to-run noise, so there is nothing to collect.
-_INDEXER_ROW_SHARD_MIN_ROWS = 256
+_INDEXER_ROW_SHARD_MIN_ROWS = int(
+    os.environ.get("ATOM_INDEXER_ROW_SHARD_MIN_ROWS", 256))
+# DIAGNOSTIC override, not a tuning knob. Setting it above any reachable row
+# count turns the shard OFF without changing a byte of the build, so shard-on
+# and shard-off are the same binary and differ only by an env var -- which is
+# the only way the A/B is not also an A/B of the compiler.
 
 # Diagnostic only, off unless ATOM_DEBUG_INDEXER_SHARD is set. It exists because
 # "the shard did not help" and "the shard did not run" look identical from the
 # outside -- which is exactly how the first attempt at this change was lost, in
 # the native sparse_attn_indexer that plugin mode never calls.
 _indexer_shard_logged = 0
+
+_indexer_shard_bufs: dict = {}
+
+
+def _indexer_shard_buffers(stride, topk, dtype, device):
+    """Persistent shard and gather buffers, grown on demand and never freed.
+
+    The first version allocated both per call. That is 78 allocations per step
+    for the shard and 78 for the gather output, and the gather output is
+    TP-size x the shard -- ~95 MB at conc 16's 1449-row stride. The caching
+    allocator hides that while there is free HBM behind
+    `--gpu-memory-utilization 0.90`; at conc 24 there is not, so it falls
+    through to the driver, and a driver allocation synchronizes the device.
+    That is why the conc 24 regression slowed DECODE by 7x as well as prefill,
+    with iteration count and tokens/iteration unchanged: the steps were not
+    doing more work, they were stalling.
+
+    No fill. Every gathered row r*stride + i is global row r*stride + i, so the
+    only rows the slice keeps are rows a rank actually wrote; the padding lives
+    past prefill_hi - prefill_lo and is dropped unread. test_indexer_row_shard.py
+    has always modelled the shard with `torch.empty` for this reason and is
+    bit-identical, which is the evidence for it.
+    """
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    world = get_tensor_model_parallel_world_size()
+    key = (topk, dtype, device, world)
+    buf = _indexer_shard_bufs.get(key)
+    if buf is None or buf[0].shape[0] < stride:
+        # Grow only: a later step with a smaller stride slices this one rather
+        # than reallocating, so the steady state is allocation-free.
+        buf = (
+            torch.empty((stride, topk), dtype=dtype, device=device),
+            torch.empty((stride * world, topk), dtype=dtype, device=device),
+        )
+        _indexer_shard_bufs[key] = buf
+    return buf[0][:stride], buf[1][: stride * world]
 
 
 def _indexer_row_shard(row_lo: int, row_hi: int) -> tuple[int, int, int]:
@@ -434,15 +476,8 @@ def sparse_attn_indexer_plugin_mode(
         prefill_hi = chunks[-1].token_end
         shard_lo, shard_hi, shard_stride = _indexer_row_shard(prefill_lo, prefill_hi)
         if shard_stride:
-            # -1 is the same fill topk_indices carries: any row this rank does
-            # not write is padding that the post-gather slice drops, so the
-            # value is never read -- but a garbage index that DID escape would
-            # be an out-of-range gather, not a wrong number, so fill it.
-            shard_out = torch.full(
-                (shard_stride, topk_tokens),
-                -1,
-                dtype=topk_indices.dtype,
-                device=topk_indices.device,
+            shard_out, gather_out = _indexer_shard_buffers(
+                shard_stride, topk_tokens, topk_indices.dtype, topk_indices.device
             )
         if os.environ.get("ATOM_DEBUG_INDEXER_SHARD"):
             if _indexer_shard_logged < 6:
@@ -564,9 +599,8 @@ def sparse_attn_indexer_plugin_mode(
                     logits.stride(1),
                     topk_tokens,
                 )
-
         if shard_stride:
-            from vllm.distributed import tensor_model_parallel_all_gather
+            from vllm.distributed.parallel_state import get_tp_group
 
             # Indices only, int32: 2048 per row, so the whole prefill batch is
             # tens of MB. Gathering VALUES too -- which a KV-column split would
@@ -575,9 +609,20 @@ def sparse_attn_indexer_plugin_mode(
             # Every rank reaches this: has_prefill and shard_stride come from
             # metadata each rank builds identically from the same batch, so
             # there is no schedule in which one rank skips the collective.
-            topk_indices[prefill_lo:prefill_hi] = tensor_model_parallel_all_gather(
-                shard_out, dim=0
-            )[: prefill_hi - prefill_lo]
+            #
+            # all_gather_into_tensor, not tensor_model_parallel_all_gather:
+            # the latter allocates its own output, which is what
+            # _indexer_shard_buffers exists to stop. Its rank-major layout is
+            # what makes the slice below correct -- gathered row r*stride + i is
+            # global row r*stride + i, exactly the identity _indexer_row_shard
+            # assigns, so the only rows past prefill_hi - prefill_lo are the
+            # last rank's padding and the slice drops them.
+            torch.distributed.all_gather_into_tensor(
+                gather_out, shard_out, group=get_tp_group().device_group
+            )
+            topk_indices[prefill_lo:prefill_hi] = gather_out[
+                : prefill_hi - prefill_lo
+            ]
 
     if has_decode:
         decode_metadata = indexer_meta.decode
