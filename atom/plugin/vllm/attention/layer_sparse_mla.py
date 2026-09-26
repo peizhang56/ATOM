@@ -665,6 +665,32 @@ def sparse_attn_indexer_plugin_mode(
         logits = torch.empty(
             [num_decode_tokens, max_model_len], dtype=torch.float32, device="cuda"
         )
+        chunk_k = 256
+        # Share one KV walk across the speculative rows. All `next_n` rows of a
+        # request read the same pages -- `seq_lens` and `block_table` are indexed
+        # by request, and the per-row causal bound `<= seq_len - next_n + n` is
+        # applied inside the kernel either way -- so at NextNTile=1 the kernel
+        # re-reads the whole context once per MTP row. Folding them makes it one
+        # read feeding NextNTile MFMAs: -14.3 % on this kernel at next_n=4 and
+        # bit-identical output (kb/indexer-decode-nextn-microbench-mi355x-
+        # 2026-09-25.md: 126.5 -> 115.8 -> 108.4 us at tile 1 / 2 / 4).
+        #
+        # The fold is only implemented on the preshuffle path, is exclusive with
+        # the varctx schedule (not used here), needs the kernel's
+        # LoadBlockIndiceForEachStage branch (ChunkK // 2 % KVBlockSize == 0),
+        # and must divide next_n. Each condition is rechecked by the aiter
+        # wrapper, which raises; the point of testing them here is to fall back
+        # to 1 instead, because next_n is 1 on any step the scheduler runs
+        # without speculation and that must keep working.
+        next_n_tile = (
+            next_n
+            if (
+                preshuffle_cache
+                and next_n > 1
+                and (chunk_k // 2) % kv_block_size == 0
+            )
+            else 1
+        )
         deepgemm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
@@ -673,10 +699,11 @@ def sparse_attn_indexer_plugin_mode(
             decode_metadata.seq_lens,
             decode_metadata.block_table,
             max_model_len,
-            ChunkK=256,
+            ChunkK=chunk_k,
             KVBlockSize=kv_block_size,
             Preshuffle=preshuffle_cache,
             WavePerEU=2,
+            NextNTile=next_n_tile,
         )
 
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
