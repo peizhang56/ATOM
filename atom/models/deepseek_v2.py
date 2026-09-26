@@ -2063,6 +2063,32 @@ def sparse_attn_indexer(
                 total_ctas=decode_metadata.indexer_fp4_n_ctas,
             )
         else:
+            # Share one KV walk across the speculative rows. All `next_n` rows
+            # of a request page over the same blocks -- `context_lens` and
+            # `block_tables` are indexed by request, and the per-row causal
+            # bound `<= seq_len - next_n + n` is applied inside the kernel
+            # either way -- so at NextNTile=1 the kernel re-reads the whole
+            # context once per MTP row.
+            #
+            # The same fold was added to the vLLM *plugin* indexer in
+            # 2df79ce04, but glm_moe_dsa does not run that path: it registers
+            # `sparse_attn_indexer` here (see the is_glm52 branch below), while
+            # the plugin registers `sparse_attn_indexer_plugin_mode`. That is
+            # why 2df79ce04 measured as an exact no-op in the served trace --
+            # same kernel median, same launch grid, same call count.
+            # kb/decode-bundle-ab-conc24-mi355x-2026-09-26.md
+            #
+            # ChunkK is left at the wrapper's default 256, so the kernel's
+            # LoadBlockIndiceForEachStage branch needs 128 % runner_block_size
+            # == 0. Each condition is rechecked by the aiter wrapper, which
+            # raises; they are tested here to fall back to 1 instead, because
+            # next_n is 1 on any step the scheduler runs without speculation
+            # and that must keep working.
+            next_n_tile = (
+                next_n
+                if (next_n > 1 and (256 // 2) % runner_block_size == 0)
+                else 1
+            )
             deepgemm_fp8_paged_mqa_logits(
                 padded_q_decode_tokens,
                 kv_cache,
@@ -2073,6 +2099,7 @@ def sparse_attn_indexer(
                 max_model_len,
                 KVBlockSize=runner_block_size,
                 Preshuffle=True,
+                NextNTile=next_n_tile,
             )
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
         top_k_per_row_decode(
