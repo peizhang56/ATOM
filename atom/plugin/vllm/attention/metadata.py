@@ -306,6 +306,27 @@ class AiterMlaSparseIndexerMetadataForVllm:
     prefill: AiterMlaSparseIndexerPrefillMetadataForVllm | None = None
 
 
+def _to_device_async(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """H2D copy that does not block the host.
+
+    A plain ``cpu_tensor.to(device)`` on *pageable* memory is synchronous with
+    respect to the host: the runtime has to stage the bytes, so it drains the
+    stream first.  In the per-step indexer metadata build that barrier costs
+    far more than the bytes are worth -- it stops the host running ahead, so
+    the GPU empties its queue and then idles while the rest of the build is
+    assembled on the CPU.
+
+    Staging through the caching *pinned* host allocator makes the copy async.
+    Reusing the staging block is safe: the allocator records the copy's event
+    and will not hand the block back until it has completed.
+    """
+    if t.device.type != "cpu":
+        return t.to(device)
+    staged = torch.empty_like(t, pin_memory=True)
+    staged.copy_(t)
+    return staged.to(device, non_blocking=True)
+
+
 # TODO (zyongye) optimize this, this is now vibe coded
 def kv_spans_from_batches(
     start_seq_loc: torch.Tensor, seq_len_per_batch: torch.Tensor, device: torch.device
@@ -349,6 +370,41 @@ def kv_spans_from_batches(
 
     # KV start offsets per batch in the concatenated KV cache
     kv_starts_per_batch = torch.cumsum(L, dim=0) - L  # [B]
+
+    if q.device.type == "cpu" and L.device.type == "cpu":
+        # Both outputs are affine in the token index with a per-batch
+        # intercept, so two length-B vectors determine them:
+        #
+        #   start[i] = S[b(i)]              S[b] = kv_start[b]
+        #   end[i]   = E[b(i)] + i          E[b] = kv_start[b]
+        #                                        + L[b] - counts[b] - q[b] + 1
+        #
+        # -- substitute local_pos = L[b] - counts[b] + (i - q[b] + 1) into
+        # end = start + local_pos to check.  The expansion to length N then
+        # belongs on the device: N is the chunk's token count (up to
+        # max_num_batched_tokens) while B is the request count, so this moves
+        # 3xB values across the bus instead of 2xN, in one async copy instead
+        # of two blocking ones.
+        packed = torch.empty((3, B), dtype=torch.long, pin_memory=True)
+        packed[0] = kv_starts_per_batch
+        packed[1] = kv_starts_per_batch + L - counts - q[:-1] + 1
+        packed[2] = counts
+        packed = packed.to(device, non_blocking=True)
+        S_dev, E_dev, counts_dev = packed[0], packed[1], packed[2]
+
+        # output_size is passed explicitly: without it repeat_interleave has
+        # to read counts back to the host to size its output, which is the
+        # very synchronisation this branch exists to remove.
+        batch_id_dev = torch.repeat_interleave(
+            torch.arange(B, device=device, dtype=torch.long),
+            counts_dev,
+            output_size=N,
+        )  # [N]
+        start_tensor = S_dev[batch_id_dev]
+        end_location = E_dev[batch_id_dev] + torch.arange(
+            N, device=device, dtype=torch.long
+        )
+        return start_tensor.int(), end_location.int()
 
     # For each selected token, which batch does it belong to?
     batch_id = torch.repeat_interleave(torch.arange(B), counts)  # [N]
@@ -2546,22 +2602,29 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         token_start = query_start_loc_cpu[reqs_start].item()
         token_end = query_start_loc_cpu[reqs_end].item()
-        total_seq_lens = seq_lens_cpu[reqs_start:reqs_end].sum()
-        seq_idx = torch.arange(0, reqs_end - reqs_start, dtype=torch.int32)
-        batch_id_per_k_token = torch.repeat_interleave(
-            seq_idx, seq_lens_cpu[reqs_start:reqs_end]
-        ).to(self.device)
+        seq_lens_chunk = seq_lens_cpu[reqs_start:reqs_end]
+        total_seq_lens = seq_lens_chunk.sum()
         assert total_seq_lens <= self.max_prefill_buffer_size
-        cu_seq_lens = (
-            torch.cat(
-                [
-                    torch.zeros(1, dtype=torch.int32),
-                    seq_lens_cpu[reqs_start:reqs_end].cumsum(dim=0),
-                ]
-            )
-            .to(torch.int32)
-            .to(self.device)
+        # batch_id_per_k_token is one entry per *cached* key, i.e. the full
+        # sequence length -- 115000 per prefill request at this ISL.  Built on
+        # the CPU and copied it is both the largest host-side tensor in the
+        # build and a second blocking transfer; expanded on the device from
+        # the length-B seq_lens it is neither.
+        num_reqs_chunk = reqs_end - reqs_start
+        seq_lens_dev = _to_device_async(
+            seq_lens_chunk.to(torch.int32), self.device
         )
+        batch_id_per_k_token = torch.repeat_interleave(
+            torch.arange(
+                0, num_reqs_chunk, dtype=torch.int32, device=self.device
+            ),
+            seq_lens_dev,
+            output_size=int(total_seq_lens),
+        )
+        cu_seq_lens = torch.zeros(
+            num_reqs_chunk + 1, dtype=torch.int32, device=self.device
+        )
+        cu_seq_lens[1:] = torch.cumsum(seq_lens_dev, dim=0, dtype=torch.int32)
         return AiterMlaSparseIndexerPrefillChunkMetadataForVllm(
             cu_seqlen_ks=cu_seqlen_ks,
             cu_seqlen_ke=cu_seqlen_ke,
