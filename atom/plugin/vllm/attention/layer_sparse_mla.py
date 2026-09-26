@@ -13,6 +13,7 @@ write, Q absorption, topk index conversion, sparse kernel, V up-projection.
 """
 
 import logging
+import os
 
 import torch
 import triton
@@ -43,6 +44,66 @@ logger = logging.getLogger("atom")
 # this budget. 0 disables the soft budget; the hard 2 GiB buffer-descriptor cap
 # in sparse_indexer_row_chunk still applies.
 _SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+
+# Below this many prefill rows, scoring them on one rank is cheaper than
+# splitting them: the TP all-gather has a ~43 us latency floor on 8x gfx950
+# (bench_indexer_allgather.py) that a small slice cannot earn back. 256 rows is
+# the measured crossover with margin -- at 128 rows the split still wins, but by
+# less than the run-to-run noise, so there is nothing to collect.
+_INDEXER_ROW_SHARD_MIN_ROWS = 256
+
+# Diagnostic only, off unless ATOM_DEBUG_INDEXER_SHARD is set. It exists because
+# "the shard did not help" and "the shard did not run" look identical from the
+# outside -- which is exactly how the first attempt at this change was lost, in
+# the native sparse_attn_indexer that plugin mode never calls.
+_indexer_shard_logged = 0
+
+
+def _indexer_row_shard(row_lo: int, row_hi: int) -> tuple[int, int, int]:
+    """This rank's `[lo, hi)` slice of prefill rows `[row_lo, row_hi)`.
+
+    The indexer is REPLICATED across TP: `Indexer` builds `wq_b`, `wk` and
+    `weights_proj` as `ReplicatedLinear`, so every rank computes bit-identical
+    queries over every row and then scores all of them. That is 8x the work for
+    1x the result.
+
+    Splitting by ROW rather than by KV column is what makes this cheap. Row i's
+    logits depend only on Q[i] and the committed KV, and every rank already
+    holds the whole KV, so a rank that scores a subset of rows produces exactly
+    the logits the replicated path produced for those rows -- no merge, no
+    reassociation, nothing to gate on accuracy. Splitting by column would
+    instead need a cross-rank top-k merge and would all-gather candidate values
+    as well as indices, 16x the traffic and more than the compute it saves.
+
+    Returns `(lo, hi, stride)` where `stride` is the padded rows-per-rank -- the
+    caller allocates `stride` rows so every rank contributes an equal shard to
+    `all_gather`, and slices the padding off afterwards. Only the last non-empty
+    rank is short, and its block sits at the END of the gathered buffer, so the
+    slice removes padding and never a row another rank was relying on.
+    `stride == 0` means do not shard; run the whole range here as before.
+
+    `row_lo`/`row_hi` are absolute token offsets, not 0-based, because the
+    caller indexes `q_fp8`/`weights`/`topk_indices` in that space and an
+    off-by-`num_decode_tokens` there would silently score decode rows.
+
+    vLLM's TP group, not aiter's: `aiter.dist.parallel_state` is a vendored copy
+    of vLLM's with its OWN `_TP` singleton, which plugin mode never initializes
+    because vLLM owns the process groups here. Imported inside the function like
+    every other vllm symbol in this file -- deepseek_v2.py imports this module
+    unconditionally, including on builds with no vLLM.
+    """
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+
+    tp_size = get_tensor_model_parallel_world_size()
+    num_rows = row_hi - row_lo
+    if tp_size <= 1 or num_rows < _INDEXER_ROW_SHARD_MIN_ROWS:
+        return row_lo, row_hi, 0
+    stride = (num_rows + tp_size - 1) // tp_size
+    lo = row_lo + get_tensor_model_parallel_rank() * stride
+    return min(lo, row_hi), min(lo + stride, row_hi), stride
 
 
 @triton.jit
@@ -266,6 +327,11 @@ def sparse_attn_indexer_plugin_mode(
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
 ) -> torch.Tensor:
+    # Hoisted: a `global` below its first read in the same scope is a
+    # SyntaxError that ast.parse does not catch and only compile() does, which
+    # costs a full 8-rank engine start to discover.
+    global _indexer_shard_logged
+
     topk_indices = torch.full(
         (hidden_states.shape[0], topk_tokens),
         -1,
@@ -356,7 +422,51 @@ def sparse_attn_indexer_plugin_mode(
     if has_prefill:
         prefill_metadata = indexer_meta.prefill
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        for chunk in prefill_metadata.chunks:
+        chunks = prefill_metadata.chunks
+        # The chunks partition the prefill tokens CONTIGUOUSLY: _build_indexer
+        # splits requests with split_prefill_chunks and reads token_start /
+        # token_end straight out of query_start_loc_cpu, so chunk k ends exactly
+        # where chunk k+1 begins and together they cover
+        # [num_decode_tokens, num_actual_tokens). That is what lets one shard
+        # span the whole prefill range and one all-gather close it, instead of a
+        # collective per chunk.
+        prefill_lo = chunks[0].token_start
+        prefill_hi = chunks[-1].token_end
+        shard_lo, shard_hi, shard_stride = _indexer_row_shard(prefill_lo, prefill_hi)
+        if shard_stride:
+            # -1 is the same fill topk_indices carries: any row this rank does
+            # not write is padding that the post-gather slice drops, so the
+            # value is never read -- but a garbage index that DID escape would
+            # be an out-of-range gather, not a wrong number, so fill it.
+            shard_out = torch.full(
+                (shard_stride, topk_tokens),
+                -1,
+                dtype=topk_indices.dtype,
+                device=topk_indices.device,
+            )
+        if os.environ.get("ATOM_DEBUG_INDEXER_SHARD"):
+            if _indexer_shard_logged < 6:
+                _indexer_shard_logged += 1
+                from vllm.distributed import get_tensor_model_parallel_rank
+
+                # print, not logger: the worker processes' "atom" logger level
+                # is not ours to assume, and a diagnostic that might be filtered
+                # reads exactly like a branch that never ran.
+                print(
+                    f"[indexer-shard] rank={get_tensor_model_parallel_rank()} "
+                    f"rows=[{prefill_lo},{prefill_hi}) nchunks={len(chunks)} -> "
+                    f"lo={shard_lo} hi={shard_hi} stride={shard_stride}",
+                    flush=True,
+                )
+        for chunk in chunks:
+            # The rows of this chunk that are ours. A chunk wholly outside this
+            # rank's shard costs nothing at all -- not even the k_fp8 gather,
+            # which is the point of testing before the allocation rather than
+            # inside the row loop.
+            chunk_lo = max(chunk.token_start, shard_lo)
+            chunk_hi = min(chunk.token_end, shard_hi)
+            if chunk_lo >= chunk_hi:
+                continue
             k_fp8 = torch.empty(
                 [chunk.total_seq_lens, head_dim],
                 device=k.device,
@@ -388,17 +498,23 @@ def sparse_attn_indexer_plugin_mode(
             # every row's top-k is exact with no cross-chunk merge and the
             # kernel's per-row column indices need no remapping.
             total_committed = int(chunk.total_seq_lens)
-            total_rows = chunk.token_end - chunk.token_start
+            # This rank's rows, not the chunk's: the budget is per allocation,
+            # and a shard that needed one chunk before must not be told to make
+            # eight because the divisor did not shrink with it.
             row_chunk = sparse_indexer_row_chunk(
-                total_rows, total_committed, _SPARSE_INDEXER_LOGITS_BUDGET_MB
+                chunk_hi - chunk_lo, total_committed, _SPARSE_INDEXER_LOGITS_BUDGET_MB
             )
 
-            for row_start in range(0, total_rows, row_chunk):
-                row_end = min(row_start + row_chunk, total_rows)
-                q_start = chunk.token_start + row_start
-                q_end = chunk.token_start + row_end
-                # cu_seqlen_ks/ke are per-row (length total_rows); slice 1:1 with
-                # this row chunk. KV stays full so per-row windows are unchanged.
+            for q_start in range(chunk_lo, chunk_hi, row_chunk):
+                q_end = min(q_start + row_chunk, chunk_hi)
+                # cu_seqlen_ks/ke are per-row and indexed from the CHUNK's
+                # start, while q_fp8/weights/topk_indices are indexed from the
+                # batch's. Under sharding those two no longer differ by a
+                # constant the loop can ignore, so convert explicitly.
+                row_start = q_start - chunk.token_start
+                row_end = q_end - chunk.token_start
+                # KV stays full, so per-row windows are unchanged and every
+                # row's top-k is the one the replicated path computed for it.
                 row_ks = chunk.cu_seqlen_ks[row_start:row_end]
                 row_ke = chunk.cu_seqlen_ke[row_start:row_end]
                 logits = fp8_mqa_logits(
@@ -429,7 +545,12 @@ def sparse_attn_indexer_plugin_mode(
                     clean_logits=False,
                 )
                 num_rows = logits.shape[0]
-                topk_indices_prefill = topk_indices[q_start:q_end, :topk_tokens]
+                if shard_stride:
+                    topk_indices_prefill = shard_out[
+                        q_start - shard_lo : q_end - shard_lo, :topk_tokens
+                    ]
+                else:
+                    topk_indices_prefill = topk_indices[q_start:q_end, :topk_tokens]
                 # Use top_k_per_row_prefill from vLLM to correctly handle row
                 # starts and ends. It also produces 0-based local indices,
                 # eliminating the need for conversion from global.
@@ -443,6 +564,20 @@ def sparse_attn_indexer_plugin_mode(
                     logits.stride(1),
                     topk_tokens,
                 )
+
+        if shard_stride:
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            # Indices only, int32: 2048 per row, so the whole prefill batch is
+            # tens of MB. Gathering VALUES too -- which a KV-column split would
+            # force -- is the 16x that makes the other partition lose.
+            #
+            # Every rank reaches this: has_prefill and shard_stride come from
+            # metadata each rank builds identically from the same batch, so
+            # there is no schedule in which one rank skips the collective.
+            topk_indices[prefill_lo:prefill_hi] = tensor_model_parallel_all_gather(
+                shard_out, dim=0
+            )[: prefill_hi - prefill_lo]
 
     if has_decode:
         decode_metadata = indexer_meta.decode
