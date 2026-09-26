@@ -63,6 +63,15 @@ _INDEXER_ROW_SHARD_MIN_ROWS = int(
 # the native sparse_attn_indexer that plugin mode never calls.
 _indexer_shard_logged = 0
 
+# ATOM_DEBUG_INDEXER_TIME=N: every N prefill calls, print where the prefill
+# indexer's time went, split into the scoring stage and the collective. It
+# SYNCHRONIZES, so the absolute numbers are inflated and are not a measurement
+# of anything -- the ratio between the two lines is the whole point, and that
+# survives the sync because both sides pay it.
+_indexer_time = {"calls": 0, "score_ms": 0.0, "gather_ms": 0.0, "logit_calls": 0,
+                 "chunks": 0, "rows": 0}
+
+
 _indexer_shard_bufs: dict = {}
 
 
@@ -475,6 +484,15 @@ def sparse_attn_indexer_plugin_mode(
         prefill_lo = chunks[0].token_start
         prefill_hi = chunks[-1].token_end
         shard_lo, shard_hi, shard_stride = _indexer_row_shard(prefill_lo, prefill_hi)
+        _t_every = int(os.environ.get("ATOM_DEBUG_INDEXER_TIME", 0))
+        if _t_every:
+            import time as _time
+
+            torch.cuda.synchronize()
+            _t0 = _time.perf_counter()
+            _indexer_time["calls"] += 1
+            _indexer_time["chunks"] += len(chunks)
+            _indexer_time["rows"] += prefill_hi - prefill_lo
         if shard_stride:
             shard_out, gather_out = _indexer_shard_buffers(
                 shard_stride, topk_tokens, topk_indices.dtype, topk_indices.device
@@ -599,6 +617,14 @@ def sparse_attn_indexer_plugin_mode(
                     logits.stride(1),
                     topk_tokens,
                 )
+                if _t_every:
+                    _indexer_time["logit_calls"] += 1
+
+        if _t_every:
+            torch.cuda.synchronize()
+            _t1 = _time.perf_counter()
+            _indexer_time["score_ms"] += (_t1 - _t0) * 1e3
+
         if shard_stride:
             from vllm.distributed.parallel_state import get_tp_group
 
@@ -623,6 +649,22 @@ def sparse_attn_indexer_plugin_mode(
             topk_indices[prefill_lo:prefill_hi] = gather_out[
                 : prefill_hi - prefill_lo
             ]
+
+        if _t_every:
+            torch.cuda.synchronize()
+            _indexer_time["gather_ms"] += (_time.perf_counter() - _t1) * 1e3
+            if _indexer_time["calls"] % _t_every == 0:
+                n = _indexer_time["calls"]
+                print(
+                    f"[indexer-time] calls={n} "
+                    f"score={_indexer_time['score_ms']/n:.2f} ms/call "
+                    f"gather={_indexer_time['gather_ms']/n:.2f} ms/call "
+                    f"logit_calls={_indexer_time['logit_calls']/n:.2f} "
+                    f"chunks={_indexer_time['chunks']/n:.2f} "
+                    f"rows={_indexer_time['rows']/n:.0f} "
+                    f"shard_stride={shard_stride}",
+                    flush=True,
+                )
 
     if has_decode:
         decode_metadata = indexer_meta.decode
