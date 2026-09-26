@@ -1466,7 +1466,32 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             )
 
         if self.head_repeat_factor > 1:
-            q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)
+            # Widen through an int32 view, not the element dtype. The duplicate
+            # is a pure byte copy -- head h of the output is head h // factor of
+            # the input, verbatim -- so the element type is irrelevant to the
+            # result, but not to the kernel: at fp8 the copy moves one byte per
+            # lane and runs at a fraction of HBM, while the same bytes viewed as
+            # int32 vectorize four-to-one. q_out is [tokens, heads, kv_lora_rank
+            # + qk_rope_head_dim] = [T, 8, 576] and contiguous, so 576 bytes per
+            # head-row is a whole number of int32 either way (576 at fp8, 1152
+            # at bf16) and the view always succeeds.
+            #
+            # Measured on MI355X (us per call, fp8 / bf16), byte-identical to
+            # the plain repeat_interleave at every width:
+            #     T=96      4.8 -> 3.6   /   5.0 -> 3.7
+            #     T=4608   53.9 -> 18.2  /  54.0 -> 30.9
+            #     T=11588 127.5 -> 37.4  / 130.5 -> 83.1
+            # T=11588 is one uncached request's prefill at ISL 115000, and this
+            # runs once per MLA layer. `expand(...).reshape(...)` on the same
+            # int32 view measures identically, so the plainer spelling stays.
+            #
+            # The counterpart un-repeat on the way out (the `[:, ::factor, :]`
+            # slice above) does NOT benefit -- bf16 strided-gather, 0.95-1.04x --
+            # and is deliberately left alone.
+            q_i32 = q_out.view(torch.int32)
+            q_out = q_i32.repeat_interleave(self.head_repeat_factor, dim=1).view(
+                q_out.dtype
+            )
 
         attn_out = self._forward_sparse_bf16_kv(q_out, kv_cache, attn_metadata)
 
