@@ -338,6 +338,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
+    # TP row shard for the sparse-MLA prefill indexer. The indexer is replicated
+    # per TP rank, so every rank scores every prefill row; sharding by row is
+    # exact and all-gathers only the int32 top-k. Whether that pays is decided
+    # by the committed-KV width, not the row count: saved work and all-gather
+    # bytes both scale with rows, so rows cancel. Measured on 8x gfx950 at
+    # GLM-5.3's indexer shape, saved/cost crosses 1.0 between width 8192 (0.63x
+    # -- a loss) and 16384 (1.22x) at every row count from 64 to 16384. Below
+    # the width gate the shard is a measured regression, so it is off.
+    # Set the width absurdly high to disable the shard in the same binary,
+    # which is how to A/B it without also A/Bing the compiler.
+    "ATOM_INDEXER_ROW_SHARD_MIN_KV_WIDTH": lambda: int(
+        os.getenv("ATOM_INDEXER_ROW_SHARD_MIN_KV_WIDTH", "16384")
+    ),
+    # A shard must also be tall enough to pay the all-gather's ~36-51 us latency
+    # floor. At or above the width gate even 64 rows clears it; 256 keeps margin
+    # for small-collective jitter.
+    "ATOM_INDEXER_ROW_SHARD_MIN_ROWS": lambda: int(
+        os.getenv("ATOM_INDEXER_ROW_SHARD_MIN_ROWS", "256")
+    ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are

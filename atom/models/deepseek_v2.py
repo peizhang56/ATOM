@@ -38,10 +38,14 @@ from aiter import (
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
 from aiter.dist.parallel_state import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -108,7 +112,12 @@ from atom.model_ops.linear import (
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+from atom.model_ops.sparse_indexer_chunk import (
+    indexer_row_shard,
+    indexer_shard_buffers,
+    indexer_shard_row_windows,
+    sparse_indexer_row_chunk,
+)
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -1823,11 +1832,50 @@ def sparse_attn_indexer(
         # single chunk fits, the loop runs exactly once and matches the original
         # single-shot behavior. ``row_width`` (not total_kv) is the buffer's real
         # column count: the FP4 scorer emits into a padded max-seq-len space.
-        chunk_tokens = sparse_indexer_row_chunk(
-            num_rows, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        #
+        # That per-chunk exactness is what lets the rows be spread across TP
+        # ranks; see indexer_row_shard. DCP, PCP and the FP4 scorer already
+        # partition these rows themselves, so they stay replicated rather than
+        # composing two splits.
+        tp_size = get_tensor_model_parallel_world_size()
+        shard_lo, shard_hi, shard_stride = (
+            indexer_row_shard(
+                0,
+                num_rows,
+                tp_size,
+                get_tensor_model_parallel_rank(),
+                row_width,
+            )
+            if not indexer_fp4 and get_dcp_world_size() <= 1 and not pcp_is_enabled()
+            else (0, num_rows, 0)
         )
-        for chunk_start in range(0, num_rows, chunk_tokens):
-            chunk_end = min(chunk_start + chunk_tokens, num_rows)
+        if shard_stride:
+            # Equal-sized shards, as all_gather requires; the tail is padding.
+            shard_out, gather_out = indexer_shard_buffers(
+                shard_stride,
+                topk_tokens,
+                topk_indices.dtype,
+                topk_indices.device,
+                tp_size,
+            )
+        else:
+            shard_out = topk_indices_prefill
+        # The native path has one implicit chunk spanning every prefill row, so
+        # the window's q-space and row-space offsets coincide; the shared helper
+        # is used for the row chunking and the shard intersection alike.
+        windows = indexer_shard_row_windows(
+            0,
+            num_rows,
+            shard_lo,
+            shard_hi,
+            lambda rows: sparse_indexer_row_chunk(
+                rows, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+            ),
+        )
+        for chunk_start, chunk_end, _, _ in windows:
+            # Inputs and window bounds stay in prefill-batch space; only the
+            # output is rebased, since a shard writes its own buffer from 0.
+            out_lo, out_hi = chunk_start - shard_lo, chunk_end - shard_lo
             # Per-row window bounds slice 1:1 with this chunk's rows.
             row_starts = cu_seqlen_ks[chunk_start:chunk_end]
             row_ends = cu_seqlen_ke[chunk_start:chunk_end]
@@ -1836,7 +1884,7 @@ def sparse_attn_indexer(
                 logits = _prefill_mqa_logits_fp4(
                     prefill_metadata,
                     chunk,
-                    chunk_tokens == num_rows,
+                    len(windows) == 1,
                     q_prefill[chunk],
                     q_fp4_scale[num_decode_tokens:num_tokens][chunk],
                     weights_prefill[chunk],
@@ -1859,21 +1907,38 @@ def sparse_attn_indexer(
                     # top-k, but `top_k_per_row_prefill` below is handed the
                     # same row_starts / row_ends and offsets every access by
                     # rowStart, bounded by rowEnd - rowStart, so it never looks
-                    # outside the window. 449 us per full-index layer at
-                    # ISL=49152.
+                    # outside the window. Checked, not just read: filling every
+                    # out-of-window column with +1e30 changes no row's
+                    # selection. 449 us per full-index layer at ISL=49152.
                     clean_logits=False,
                 )
             top_k_per_row_prefill(
                 logits=logits,
                 rowStarts=row_starts,
                 rowEnds=row_ends,
-                indices=topk_indices_prefill[chunk_start:chunk_end],
+                indices=shard_out[out_lo:out_hi],
                 values=None,
                 numRows=chunk_end - chunk_start,
                 stride0=logits.stride(0),
                 stride1=logits.stride(1),
                 stable=stable_topk,
             )
+        if shard_stride:
+            # Every rank needs every row: TP shards heads, not rows. Only the
+            # int32 indices cross the wire; the fp32 logits plane dies here.
+            #
+            # all_gather_into_tensor into a persistent buffer, not
+            # tensor_model_parallel_all_gather, which torch.empty()s a
+            # world-size-x output on every call. That allocation is not free
+            # here: the indexer's all-gather is where HBM exhaustion lands, and
+            # it has killed the engine from this exact collective. Its
+            # rank-major layout is also what makes the slice correct -- gathered
+            # row r*stride + i is global row r*stride + i, so the only excess is
+            # the last rank's padding.
+            torch.distributed.all_gather_into_tensor(
+                gather_out, shard_out, group=get_tp_group().device_group
+            )
+            topk_indices_prefill.copy_(gather_out[:num_rows])
         if get_dcp_world_size() > 1:
             # DCP: topk_indices hold GLOBAL flat KV indices (the indexer scored the
             # full sequence via the all-gathered k). Keep only the positions this

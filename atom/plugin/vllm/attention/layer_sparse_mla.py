@@ -27,7 +27,12 @@ from aiter import (
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+from atom.model_ops.sparse_indexer_chunk import (
+    indexer_row_shard,
+    indexer_shard_buffers,
+    indexer_shard_row_windows,
+    sparse_indexer_row_chunk,
+)
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -43,6 +48,41 @@ logger = logging.getLogger("atom")
 # this budget. 0 disables the soft budget; the hard 2 GiB buffer-descriptor cap
 # in sparse_indexer_row_chunk still applies.
 _SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+
+
+def _indexer_prefill_shard(chunks) -> tuple[int, int, int]:
+    """This rank's prefill row slice across `chunks`, and the shard stride.
+
+    The chunks partition the prefill tokens contiguously (`_build_indexer` reads
+    token_start/token_end out of `query_start_loc_cpu`), so one shard spans the
+    whole range and one all-gather closes it, rather than a collective per
+    chunk. Offsets are absolute batch token offsets, the space `q_fp8` and
+    friends are indexed in; an off-by-`num_decode_tokens` here would score
+    decode rows.
+
+    The gate wants the committed-KV width the average row is scored against,
+    which differs per chunk, so weight each chunk's width by its rows.
+
+    vLLM's TP group, not aiter's vendored copy, whose `_TP` singleton plugin
+    mode never initializes -- imported inside the function because
+    deepseek_v2.py imports this module even on builds with no vLLM.
+    """
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+
+    rows = sum(c.token_end - c.token_start for c in chunks)
+    weighted_kv = sum(
+        (c.token_end - c.token_start) * int(c.total_seq_lens) for c in chunks
+    )
+    return indexer_row_shard(
+        chunks[0].token_start,
+        chunks[-1].token_end,
+        get_tensor_model_parallel_world_size(),
+        get_tensor_model_parallel_rank(),
+        weighted_kv // rows if rows else 0,
+    )
 
 
 @triton.jit
@@ -356,7 +396,45 @@ def sparse_attn_indexer_plugin_mode(
     if has_prefill:
         prefill_metadata = indexer_meta.prefill
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        for chunk in prefill_metadata.chunks:
+        chunks = prefill_metadata.chunks
+        prefill_lo = chunks[0].token_start
+        prefill_hi = chunks[-1].token_end
+        shard_lo, shard_hi, shard_stride = _indexer_prefill_shard(chunks)
+        if shard_stride:
+            from vllm.distributed import get_tensor_model_parallel_world_size
+
+            shard_out, gather_out = indexer_shard_buffers(
+                shard_stride,
+                topk_tokens,
+                topk_indices.dtype,
+                topk_indices.device,
+                get_tensor_model_parallel_world_size(),
+            )
+        for chunk in chunks:
+            # The dense fp8_mqa_logits buffer is [rows, total_committed] fp32.
+            # total_committed (the column dim = sum of co-scheduled prefill
+            # contexts) is unbounded by max_num_batched_tokens, so a burst of
+            # long-context requests can push a single allocation to tens of GiB
+            # (#1376) — and landing on exactly 2 GiB aborts every rank in the
+            # Triton backend. Chunk along the Q (row) dimension so [row_chunk,
+            # total_committed] fp32 stays within budget — row_chunk shrinks as
+            # total_committed grows. Each row chunk still scores the FULL KV, so
+            # every row's top-k is exact with no cross-chunk merge and the
+            # kernel's per-row column indices need no remapping.
+            total_committed = int(chunk.total_seq_lens)
+            windows = indexer_shard_row_windows(
+                chunk.token_start,
+                chunk.token_end,
+                shard_lo,
+                shard_hi,
+                lambda rows, width=total_committed: sparse_indexer_row_chunk(
+                    rows, width, _SPARSE_INDEXER_LOGITS_BUDGET_MB
+                ),
+            )
+            # Resolved before the k_fp8 gather, so a chunk outside this shard
+            # costs nothing at all.
+            if not windows:
+                continue
             k_fp8 = torch.empty(
                 [chunk.total_seq_lens, head_dim],
                 device=k.device,
@@ -377,28 +455,8 @@ def sparse_attn_indexer_plugin_mode(
                 preshuffle=preshuffle_cache,
             )
 
-            # The dense fp8_mqa_logits buffer is [rows, total_committed] fp32.
-            # total_committed (the column dim = sum of co-scheduled prefill
-            # contexts) is unbounded by max_num_batched_tokens, so a burst of
-            # long-context requests can push a single allocation to tens of GiB
-            # (#1376) — and landing on exactly 2 GiB aborts every rank in the
-            # Triton backend. Chunk along the Q (row) dimension so [row_chunk,
-            # total_committed] fp32 stays within budget — row_chunk shrinks as
-            # total_committed grows. Each row chunk still scores the FULL KV, so
-            # every row's top-k is exact with no cross-chunk merge and the
-            # kernel's per-row column indices need no remapping.
-            total_committed = int(chunk.total_seq_lens)
-            total_rows = chunk.token_end - chunk.token_start
-            row_chunk = sparse_indexer_row_chunk(
-                total_rows, total_committed, _SPARSE_INDEXER_LOGITS_BUDGET_MB
-            )
-
-            for row_start in range(0, total_rows, row_chunk):
-                row_end = min(row_start + row_chunk, total_rows)
-                q_start = chunk.token_start + row_start
-                q_end = chunk.token_start + row_end
-                # cu_seqlen_ks/ke are per-row (length total_rows); slice 1:1 with
-                # this row chunk. KV stays full so per-row windows are unchanged.
+            for q_start, q_end, row_start, row_end in windows:
+                # KV stays full, so per-row windows and top-k are unchanged.
                 row_ks = chunk.cu_seqlen_ks[row_start:row_end]
                 row_ke = chunk.cu_seqlen_ke[row_start:row_end]
                 logits = fp8_mqa_logits(
@@ -408,9 +466,30 @@ def sparse_attn_indexer_plugin_mode(
                     weights=weights[q_start:q_end],
                     cu_starts=row_ks,
                     cu_ends=row_ke,
+                    # The -inf prefill has no reader, so skip it (the native
+                    # paths already do). It guards against a position outside a
+                    # row's window winning the top-k, but top_k_per_row_prefill
+                    # gets the same row_ks/row_ke and never looks outside the
+                    # window; clean_logits=False only relaxes the per-row store
+                    # mask, not the union bound that keeps the store inside the
+                    # row's allocation.
+                    #
+                    # Checked, not just read: filling every out-of-window column
+                    # with +1e30 -- values that would dominate the top-k if they
+                    # were read at all -- changes no row's selection, on either
+                    # clean_logits setting.
+                    #
+                    # Worth skipping: the -inf fill covers ~3x the band the
+                    # logits kernel writes, 4.97 % of prefill GPU time.
+                    clean_logits=False,
                 )
                 num_rows = logits.shape[0]
-                topk_indices_prefill = topk_indices[q_start:q_end, :topk_tokens]
+                if shard_stride:
+                    topk_indices_prefill = shard_out[
+                        q_start - shard_lo : q_end - shard_lo, :topk_tokens
+                    ]
+                else:
+                    topk_indices_prefill = topk_indices[q_start:q_end, :topk_tokens]
                 # Use top_k_per_row_prefill from vLLM to correctly handle row
                 # starts and ends. It also produces 0-based local indices,
                 # eliminating the need for conversion from global.
@@ -424,6 +503,21 @@ def sparse_attn_indexer_plugin_mode(
                     logits.stride(1),
                     topk_tokens,
                 )
+        if shard_stride:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            # Indices only, int32 -- tens of MB for the batch. Every rank
+            # reaches this: has_prefill and shard_stride come from metadata each
+            # rank builds identically, so none can skip the collective.
+            #
+            # all_gather_into_tensor, not tensor_model_parallel_all_gather,
+            # which allocates its own output. Its rank-major layout is what
+            # makes the slice correct: gathered row r*stride + i is global row
+            # r*stride + i, so the only excess is the last rank's padding.
+            torch.distributed.all_gather_into_tensor(
+                gather_out, shard_out, group=get_tp_group().device_group
+            )
+            topk_indices[prefill_lo:prefill_hi] = gather_out[: prefill_hi - prefill_lo]
 
     if has_decode:
         decode_metadata = indexer_meta.decode
