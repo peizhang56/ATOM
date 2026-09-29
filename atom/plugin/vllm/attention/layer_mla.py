@@ -1468,12 +1468,20 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         if self.head_repeat_factor > 1:
             # The duplicate is a pure byte copy, so widen through an int32 view
             # to vectorize it four-to-one: 3.4x at T=11588 (one request's
-            # prefill at ISL 115k), bit-identical. q_out is [T, 8, 576] and
-            # contiguous, so the view always succeeds.
-            q_i32 = q_out.view(torch.int32)
-            q_out = q_i32.repeat_interleave(self.head_repeat_factor, dim=1).view(
-                q_out.dtype
-            )
+            # prefill at ISL 115k), bit-identical. The view needs a contiguous
+            # tensor whose rows divide into int32, which holds for the [T, 8,
+            # 576] bf16 this path is built for; anything narrower or unaligned
+            # would make .view raise, so it takes the plain copy instead.
+            row_bytes = q_out.shape[-1] * q_out.element_size()
+            if q_out.is_contiguous() and row_bytes % 4 == 0:
+                dtype = q_out.dtype
+                q_out = (
+                    q_out.view(torch.int32)
+                    .repeat_interleave(self.head_repeat_factor, dim=1)
+                    .view(dtype)
+                )
+            else:
+                q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)
 
         attn_out = self._forward_sparse_bf16_kv(q_out, kv_cache, attn_metadata)
 
