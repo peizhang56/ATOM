@@ -12,7 +12,9 @@ forward_impl_sparse handles everything end-to-end: RoPE, KV cache
 write, Q absorption, topk index conversion, sparse kernel, V up-projection.
 """
 
+import inspect
 import logging
+import os
 
 import torch
 import triton
@@ -28,6 +30,33 @@ from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
 from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+
+# An older aiter has no NextNTile, and an unknown keyword is a TypeError on
+# every decode step -- so offer the fold only when it is declared.
+_AITER_HAS_NEXT_N_TILE = (
+    "NextNTile" in inspect.signature(deepgemm_fp8_paged_mqa_logits).parameters
+)
+
+# `index_heads * NextNTile` accumulators stay live across the KV walk; past 128
+# the kernel spills and aiter asserts rather than run slower than not folding.
+_MQA_LOGITS_FOLD_BUDGET = 128
+
+
+def _mqa_logits_fold(next_n: int, index_heads: int) -> int:
+    """How many speculative rows one KV walk may serve; 1 means no fold.
+    The largest divisor of `next_n` inside the VGPR budget."""
+    if not _AITER_HAS_NEXT_N_TILE or next_n <= 1:
+        return 1
+    return next(
+        (
+            t
+            for t in range(next_n, 0, -1)
+            if next_n % t == 0 and index_heads * t <= _MQA_LOGITS_FOLD_BUDGET
+        ),
+        1,
+    )
+
+
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -43,6 +72,53 @@ logger = logging.getLogger("atom")
 # this budget. 0 disables the soft budget; the hard 2 GiB buffer-descriptor cap
 # in sparse_indexer_row_chunk still applies.
 _SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+
+# Below this the all-gather's ~43 us floor outweighs the split. Raising it
+# past any reachable row count disables the shard, for an A/B of it alone.
+_INDEXER_ROW_SHARD_MIN_ROWS = int(
+    os.environ.get("ATOM_INDEXER_ROW_SHARD_MIN_ROWS", "256")
+)
+
+# Diagnostic only, off unless ATOM_DEBUG_INDEXER_SHARD is set: "the shard did
+# not help" and "the shard did not run" look identical from the outside.
+_indexer_shard_logged = 0
+
+_indexer_shard_bufs: dict = {}
+
+
+def _indexer_shard_buffers(stride, topk, dtype, device):
+    """Persistent shard and gather buffers, grown on demand, never freed:
+    allocating per call falls through to the driver and synchronizes."""
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    world = get_tensor_model_parallel_world_size()
+    key = (topk, dtype, device, world)
+    buf = _indexer_shard_bufs.get(key)
+    if buf is None or buf[0].shape[0] < stride:
+        # Grow only, so the steady state is allocation-free.
+        buf = (
+            torch.empty((stride, topk), dtype=dtype, device=device),
+            torch.empty((stride * world, topk), dtype=dtype, device=device),
+        )
+        _indexer_shard_bufs[key] = buf
+    return buf[0][:stride], buf[1][: stride * world]
+
+
+def _indexer_row_shard(row_lo: int, row_hi: int) -> tuple[int, int, int]:
+    """This rank's `[lo, hi)` slice of prefill rows `[row_lo, row_hi)`, which
+    are absolute token offsets, plus the padded stride. 0 means do not shard."""
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+
+    tp_size = get_tensor_model_parallel_world_size()
+    num_rows = row_hi - row_lo
+    if tp_size <= 1 or num_rows < _INDEXER_ROW_SHARD_MIN_ROWS:
+        return row_lo, row_hi, 0
+    stride = (num_rows + tp_size - 1) // tp_size
+    lo = row_lo + get_tensor_model_parallel_rank() * stride
+    return min(lo, row_hi), min(lo + stride, row_hi), stride
 
 
 @triton.jit
@@ -266,6 +342,10 @@ def sparse_attn_indexer_plugin_mode(
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
 ) -> torch.Tensor:
+    # Hoisted: a `global` below its first read is a SyntaxError that only
+    # compile() catches, costing a full 8-rank engine start to discover.
+    global _indexer_shard_logged
+
     topk_indices = torch.full(
         (hidden_states.shape[0], topk_tokens),
         -1,
@@ -356,7 +436,35 @@ def sparse_attn_indexer_plugin_mode(
     if has_prefill:
         prefill_metadata = indexer_meta.prefill
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        for chunk in prefill_metadata.chunks:
+        chunks = prefill_metadata.chunks
+        # The chunks partition the prefill tokens contiguously, so one shard
+        # spans them all and one all-gather closes it.
+        prefill_lo = chunks[0].token_start
+        prefill_hi = chunks[-1].token_end
+        shard_lo, shard_hi, shard_stride = _indexer_row_shard(prefill_lo, prefill_hi)
+        if shard_stride:
+            shard_out, gather_out = _indexer_shard_buffers(
+                shard_stride, topk_tokens, topk_indices.dtype, topk_indices.device
+            )
+        if os.environ.get("ATOM_DEBUG_INDEXER_SHARD") and _indexer_shard_logged < 6:
+            _indexer_shard_logged += 1
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            # print, not logger: a diagnostic that might be filtered reads
+            # exactly like a branch that never ran.
+            print(
+                f"[indexer-shard] rank={get_tensor_model_parallel_rank()} "
+                f"rows=[{prefill_lo},{prefill_hi}) nchunks={len(chunks)} -> "
+                f"lo={shard_lo} hi={shard_hi} stride={shard_stride}",
+                flush=True,
+            )
+        for chunk in chunks:
+            # The rows of this chunk that are ours. Tested before the k_fp8
+            # gather, so a chunk outside this shard costs nothing at all.
+            chunk_lo = max(chunk.token_start, shard_lo)
+            chunk_hi = min(chunk.token_end, shard_hi)
+            if chunk_lo >= chunk_hi:
+                continue
             k_fp8 = torch.empty(
                 [chunk.total_seq_lens, head_dim],
                 device=k.device,
@@ -388,17 +496,18 @@ def sparse_attn_indexer_plugin_mode(
             # every row's top-k is exact with no cross-chunk merge and the
             # kernel's per-row column indices need no remapping.
             total_committed = int(chunk.total_seq_lens)
-            total_rows = chunk.token_end - chunk.token_start
+            # This rank's rows, not the chunk's: the budget is per allocation,
+            # so the divisor has to shrink with the shard.
             row_chunk = sparse_indexer_row_chunk(
-                total_rows, total_committed, _SPARSE_INDEXER_LOGITS_BUDGET_MB
+                chunk_hi - chunk_lo, total_committed, _SPARSE_INDEXER_LOGITS_BUDGET_MB
             )
 
-            for row_start in range(0, total_rows, row_chunk):
-                row_end = min(row_start + row_chunk, total_rows)
-                q_start = chunk.token_start + row_start
-                q_end = chunk.token_start + row_end
-                # cu_seqlen_ks/ke are per-row (length total_rows); slice 1:1 with
-                # this row chunk. KV stays full so per-row windows are unchanged.
+            for q_start in range(chunk_lo, chunk_hi, row_chunk):
+                q_end = min(q_start + row_chunk, chunk_hi)
+                # cu_seqlen_ks/ke index from the chunk's start, q_fp8 from
+                # the batch's; sharding breaks the constant offset.
+                row_start = q_start - chunk.token_start
+                row_end = q_end - chunk.token_start
                 row_ks = chunk.cu_seqlen_ks[row_start:row_end]
                 row_ke = chunk.cu_seqlen_ke[row_start:row_end]
                 logits = fp8_mqa_logits(
@@ -408,9 +517,17 @@ def sparse_attn_indexer_plugin_mode(
                     weights=weights[q_start:q_end],
                     cu_starts=row_ks,
                     cu_ends=row_ke,
+                    # The -inf fill has no reader -- top_k_per_row_prefill
+                    # gets the same bounds. 4.97 % of prefill GPU time.
+                    clean_logits=False,
                 )
                 num_rows = logits.shape[0]
-                topk_indices_prefill = topk_indices[q_start:q_end, :topk_tokens]
+                if shard_stride:
+                    topk_indices_prefill = shard_out[
+                        q_start - shard_lo : q_end - shard_lo, :topk_tokens
+                    ]
+                else:
+                    topk_indices_prefill = topk_indices[q_start:q_end, :topk_tokens]
                 # Use top_k_per_row_prefill from vLLM to correctly handle row
                 # starts and ends. It also produces 0-based local indices,
                 # eliminating the need for conversion from global.
@@ -424,6 +541,15 @@ def sparse_attn_indexer_plugin_mode(
                     logits.stride(1),
                     topk_tokens,
                 )
+        if shard_stride:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            # Indices only, int32. Every rank reaches this identically, and
+            # the rank-major layout is what makes the slice below correct.
+            torch.distributed.all_gather_into_tensor(
+                gather_out, shard_out, group=get_tp_group().device_group
+            )
+            topk_indices[prefill_lo:prefill_hi] = gather_out[: prefill_hi - prefill_lo]
 
     if has_decode:
         decode_metadata = indexer_meta.decode
@@ -466,6 +592,14 @@ def sparse_attn_indexer_plugin_mode(
         logits = torch.empty(
             [num_decode_tokens, max_model_len], dtype=torch.float32, device="cuda"
         )
+        chunk_k = 256
+        # All `next_n` rows read the same pages, so share one KV walk:
+        # -14.3 % at next_n=4, bit-identical. aiter rechecks and raises.
+        if preshuffle_cache and (chunk_k // 2) % kv_block_size == 0:
+            next_n_tile = _mqa_logits_fold(next_n, padded_q_fp8_decode_tokens.shape[2])
+        else:
+            next_n_tile = 1
+        fold_kwargs = {"NextNTile": next_n_tile} if _AITER_HAS_NEXT_N_TILE else {}
         deepgemm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
@@ -474,10 +608,11 @@ def sparse_attn_indexer_plugin_mode(
             decode_metadata.seq_lens,
             decode_metadata.block_table,
             max_model_len,
-            ChunkK=256,
+            ChunkK=chunk_k,
             KVBlockSize=kv_block_size,
             Preshuffle=preshuffle_cache,
             WavePerEU=2,
+            **fold_kwargs,
         )
 
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
