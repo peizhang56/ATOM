@@ -38,6 +38,9 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+    "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB",
+    "ATOM_INDEXER_ROW_SHARD_MIN_KV_WIDTH",
+    "ATOM_INDEXER_ROW_SHARD_MIN_ROWS",
 ]
 
 
@@ -325,3 +328,53 @@ def test_malformed_offload_timeout_names_the_variable(monkeypatch):
     monkeypatch.setenv("OFFLOAD_PUBLICATION_TIMEOUT_S", "soon")
     with pytest.raises(ValueError, match="OFFLOAD_PUBLICATION_TIMEOUT_S must be"):
         _ = _get_envs().OFFLOAD_PUBLICATION_TIMEOUT_S
+
+
+def test_sparse_indexer_env_vars_are_documented():
+    """Every sparse-MLA indexer knob appears in the central env reference."""
+    import pathlib
+
+    from atom.utils import envs
+
+    doc = (
+        pathlib.Path(__file__).parents[1] / "docs" / "environment_variables.md"
+    ).read_text()
+    indexer = [
+        name
+        for name in envs.environment_variables
+        if name.startswith(("ATOM_SPARSE_INDEXER_", "ATOM_INDEXER_ROW_SHARD_"))
+    ]
+    assert indexer
+    assert [name for name in indexer if f"**{name}**" not in doc] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "default"),
+    [
+        ("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", 2048),
+        ("ATOM_INDEXER_ROW_SHARD_MIN_KV_WIDTH", 16384),
+        ("ATOM_INDEXER_ROW_SHARD_MIN_ROWS", 256),
+    ],
+)
+def test_sparse_indexer_knob_defaults(name, default):
+    """The row-shard gates default to the widths the shard was measured to win at."""
+    assert getattr(_get_envs(), name) == default
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["ATOM_INDEXER_ROW_SHARD_MIN_KV_WIDTH", "ATOM_INDEXER_ROW_SHARD_MIN_ROWS"],
+)
+def test_sparse_indexer_row_shard_knobs_are_overridable(monkeypatch, name):
+    """Raising the gate out of reach is the documented way to A/B the shard."""
+    monkeypatch.setenv(name, "1099511627776")
+    assert getattr(_get_envs(), name) == 1 << 40
+
+
+def test_row_shard_gates_follow_the_env_without_reimport(monkeypatch):
+    """Read per call, not snapshotted at import, so a set env takes effect."""
+    from atom.model_ops.sparse_indexer_chunk import indexer_row_shard
+
+    assert indexer_row_shard(0, 16384, 8, 0, 8192)[2] == 0, "8192 is below the gate"
+    monkeypatch.setenv("ATOM_INDEXER_ROW_SHARD_MIN_KV_WIDTH", "4096")
+    assert indexer_row_shard(0, 16384, 8, 0, 8192)[2] != 0, "lowered gate must apply"

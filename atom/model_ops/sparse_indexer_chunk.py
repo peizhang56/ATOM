@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Row chunking for the dense ``fp8_mqa_logits`` indexer logits buffer.
+"""Row chunking and TP row sharding for the dense ``fp8_mqa_logits`` indexer.
 
-Every sparse-MLA indexer prefill path (native DeepSeek V3.2/V4, GLM-5.x, and the
-vLLM plugin) scores queries against the committed KV through a dense
-``[rows, row_width]`` fp32 logits matrix. ``row_width`` is the sum of all
-co-scheduled prefill contexts, which ``max_num_batched_tokens`` does not bound,
-so a burst of long-context requests can push one allocation to tens of GiB
-(issue #1376). Those paths therefore split the Q rows into chunks; this module
-owns the one rule they all need to agree on.
+The logits matrix is ``[rows, row_width]`` fp32 with ``row_width`` unbounded by
+``max_num_batched_tokens`` (#1376), so the indexer prefill paths chunk the Q rows
+and shard them across TP. Both call sites import these rules from here.
 """
+
+from atom.utils import envs
 
 # A buffer resource descriptor addresses at most 2^31 bytes, so aiter's
 # fp8_mqa_logits drops to plain global load/store once the logits tensor reaches
@@ -55,3 +53,63 @@ def sparse_indexer_row_chunk(total_rows: int, row_width: int, budget_mb: int) ->
     if max_rows >= _ROW_TILE:
         return (max_rows // _ROW_TILE) * _ROW_TILE
     return 1 << (max(1, max_rows).bit_length() - 1)
+
+
+def indexer_row_shard(
+    row_lo: int,
+    row_hi: int,
+    tp_size: int,
+    tp_rank: int,
+    kv_width: int,
+    *,
+    min_rows: int | None = None,
+    min_kv_width: int | None = None,
+) -> tuple[int, int, int]:
+    """This rank's ``[lo, hi)`` slice of prefill rows, plus the all-gather stride.
+
+    Row sharding is exact (row ``i`` needs only ``Q[i]`` and KV every rank holds)
+    but not bit-identical, since ``top_k_per_row_prefill`` breaks ties arbitrarily.
+    ``stride`` is the padded rows-per-rank, equal on every rank; 0 = do not shard.
+    """
+    # Gate on KV width, not rows: saved work and all-gather bytes both scale with
+    # rows, so rows cancel. The row floor pays the all-gather's ~36-51 us latency.
+    if min_rows is None:
+        min_rows = envs.ATOM_INDEXER_ROW_SHARD_MIN_ROWS
+    if min_kv_width is None:
+        min_kv_width = envs.ATOM_INDEXER_ROW_SHARD_MIN_KV_WIDTH
+
+    num_rows = row_hi - row_lo
+    if tp_size <= 1 or num_rows < min_rows or kv_width < min_kv_width:
+        return row_lo, row_hi, 0
+    stride = (num_rows + tp_size - 1) // tp_size
+    lo = row_lo + tp_rank * stride
+    return min(lo, row_hi), min(lo + stride, row_hi), stride
+
+
+def indexer_shard_row_windows(
+    token_start: int,
+    token_end: int,
+    shard_lo: int,
+    shard_hi: int,
+    row_chunk_fn,
+) -> list[tuple[int, int, int, int]]:
+    """This shard's ``(q_start, q_end, row_start, row_end)`` windows in one chunk.
+
+    ``q_*`` index per-token tensors, ``row_*`` the chunk-local window bounds; once
+    sharded the two differ, and mixing them scores the wrong rows. Empty when the
+    chunk misses this shard, so the caller can skip its KV gather.
+    """
+    lo = max(token_start, shard_lo)
+    hi = min(token_end, shard_hi)
+    if lo >= hi:
+        return []
+    row_chunk = row_chunk_fn(hi - lo)
+    return [
+        (
+            q_start,
+            min(q_start + row_chunk, hi),
+            q_start - token_start,
+            min(q_start + row_chunk, hi) - token_start,
+        )
+        for q_start in range(lo, hi, row_chunk)
+    ]

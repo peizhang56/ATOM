@@ -38,10 +38,14 @@ from aiter import (
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
 from aiter.dist.parallel_state import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -108,7 +112,11 @@ from atom.model_ops.linear import (
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+from atom.model_ops.sparse_indexer_chunk import (
+    indexer_row_shard,
+    indexer_shard_row_windows,
+    sparse_indexer_row_chunk,
+)
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -1823,11 +1831,49 @@ def sparse_attn_indexer(
         # single chunk fits, the loop runs exactly once and matches the original
         # single-shot behavior. ``row_width`` (not total_kv) is the buffer's real
         # column count: the FP4 scorer emits into a padded max-seq-len space.
-        chunk_tokens = sparse_indexer_row_chunk(
-            num_rows, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        #
+        # Rows are also TP-sharded. DCP, PCP and the FP4 scorer already partition
+        # them, so those stay replicated rather than splitting twice.
+        tp_size = get_tensor_model_parallel_world_size()
+        shard_lo, shard_hi, shard_stride = (
+            indexer_row_shard(
+                0,
+                num_rows,
+                tp_size,
+                get_tensor_model_parallel_rank(),
+                row_width,
+            )
+            if not indexer_fp4 and get_dcp_world_size() <= 1 and not pcp_is_enabled()
+            else (0, num_rows, 0)
         )
-        for chunk_start in range(0, num_rows, chunk_tokens):
-            chunk_end = min(chunk_start + chunk_tokens, num_rows)
+        if shard_stride:
+            # Equal-sized shards, as all_gather requires; the tail is padding.
+            shard_out = torch.empty(
+                (shard_stride, topk_tokens),
+                dtype=topk_indices.dtype,
+                device=topk_indices.device,
+            )
+            gather_out = torch.empty(
+                (shard_stride * tp_size, topk_tokens),
+                dtype=topk_indices.dtype,
+                device=topk_indices.device,
+            )
+        else:
+            shard_out = topk_indices_prefill
+        # One implicit chunk spans every prefill row, so q-space and row-space
+        # coincide and the row_* fields go unused.
+        windows = indexer_shard_row_windows(
+            0,
+            num_rows,
+            shard_lo,
+            shard_hi,
+            lambda rows: sparse_indexer_row_chunk(
+                rows, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+            ),
+        )
+        for chunk_start, chunk_end, _, _ in windows:
+            # Only the output is rebased: a shard writes its own buffer from 0.
+            out_lo, out_hi = chunk_start - shard_lo, chunk_end - shard_lo
             # Per-row window bounds slice 1:1 with this chunk's rows.
             row_starts = cu_seqlen_ks[chunk_start:chunk_end]
             row_ends = cu_seqlen_ke[chunk_start:chunk_end]
@@ -1836,7 +1882,7 @@ def sparse_attn_indexer(
                 logits = _prefill_mqa_logits_fp4(
                     prefill_metadata,
                     chunk,
-                    chunk_tokens == num_rows,
+                    len(windows) == 1,
                     q_prefill[chunk],
                     q_fp4_scale[num_decode_tokens:num_tokens][chunk],
                     weights_prefill[chunk],
@@ -1867,13 +1913,21 @@ def sparse_attn_indexer(
                 logits=logits,
                 rowStarts=row_starts,
                 rowEnds=row_ends,
-                indices=topk_indices_prefill[chunk_start:chunk_end],
+                indices=shard_out[out_lo:out_hi],
                 values=None,
                 numRows=chunk_end - chunk_start,
                 stride0=logits.stride(0),
                 stride1=logits.stride(1),
                 stable=stable_topk,
             )
+        if shard_stride:
+            # Rank-major, so the last rank's padding lands at the end where the
+            # slice drops it. Not tensor_model_parallel_all_gather: it allocates
+            # a world-size-x output per call.
+            torch.distributed.all_gather_into_tensor(
+                gather_out, shard_out, group=get_tp_group().device_group
+            )
+            topk_indices_prefill.copy_(gather_out[:num_rows])
         if get_dcp_world_size() > 1:
             # DCP: topk_indices hold GLOBAL flat KV indices (the indexer scored the
             # full sequence via the all-gathered k). Keep only the positions this
