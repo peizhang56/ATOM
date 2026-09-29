@@ -338,6 +338,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
+    # Committed-KV width at which the indexer's TP row shard is taken; below it
+    # the shard is a measured regression. Set very high to disable it.
+    "ATOM_INDEXER_ROW_SHARD_MIN_KV_WIDTH": lambda: int(
+        os.getenv("ATOM_INDEXER_ROW_SHARD_MIN_KV_WIDTH", "16384")
+    ),
+    # Minimum shard rows, so the all-gather's ~36-51 us latency floor is paid.
+    "ATOM_INDEXER_ROW_SHARD_MIN_ROWS": lambda: int(
+        os.getenv("ATOM_INDEXER_ROW_SHARD_MIN_ROWS", "256")
+    ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are

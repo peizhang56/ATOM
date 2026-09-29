@@ -128,6 +128,17 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_MONO_TRACE** | path | unset | Debug aid for `ATOM_MONO_ENABLE`: rank 0 appends every mono step's input tokens, positions, top-2 logits and greedy pick to this file (one JSON line per step), with a fingerprint of every stage (dense layers, each sparse layer's output, the cache history it reads). Two runs of the same prompt then align token by token. Run it with `--enforce-eager`. |
 | **ATOM_MONO_TIMELINE** | path prefix | unset | Debug aid for `ATOM_MONO_ENABLE`: the mono layer kernels are built with their per-phase `s_memrealtime` stamps, each sparse layer into its own buffer, and after 20 warm-up steps of every decode token count S the next 5 steps are saved per rank as `<prefix>_r<rank>_s<S>_<i>.pt` (int64 [layer][CTA][stamp], 100 MHz ticks, 0 = not reached). Run it with `--enforce-eager`: a graph replay runs no Python. |
 
+## Sparse MLA indexer (DSA)
+
+Applies to every sparse-MLA indexer prefill path — native DeepSeek V3.2/V4,
+GLM-5.x, and the vLLM plugin — which share `atom/model_ops/sparse_indexer_chunk.py`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB** | int | 2048 | Soft byte budget (MB) for the dense `fp8_mqa_logits` prefill logits buffer. The matrix is `[rows, total_kv]` fp32 and `total_kv` (the sum of all co-scheduled prefill contexts) is unbounded by `max_num_batched_tokens`, so a burst of long-context requests can push one allocation to tens of GiB and OOM the engine (#1376). Chunking along the Q-row dimension keeps it in budget; each chunk still scores the full KV, so every row's top-k stays exact. `0` disables the soft budget — aiter's hard 2 GiB buffer-descriptor cap still applies, and exceeding it aborts every rank without a Python traceback. |
+| **ATOM_INDEXER_ROW_SHARD_MIN_KV_WIDTH** | int | 16384 | Minimum committed-KV width at which the TP row shard is taken. The indexer is otherwise replicated, so every rank scores every prefill row; sharding by row is exact and all-gathers only the int32 top-k. Width decides whether it pays, not row count — saved work and all-gather bytes both scale with rows, so rows cancel. Measured saved/cost crosses 1.0 between width 8192 (0.63x, a loss) and 16384 (1.22x). Set very high to disable the shard. |
+| **ATOM_INDEXER_ROW_SHARD_MIN_ROWS** | int | 256 | Minimum prefill rows for the TP row shard, so it is tall enough to pay the all-gather's ~36–51 us latency floor. Both this and the width gate must pass. |
+
 ## MoE all2all (MoRI) wire format
 
 Both are opt-in and default to off; they only apply with DP attention + expert
