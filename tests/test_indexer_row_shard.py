@@ -20,6 +20,8 @@ import pytest
 
 from atom.models.deepseek_v2 import (
     _INDEXER_ROW_SHARD_MIN_ROWS,
+)
+from atom.models.deepseek_v2 import (
     _indexer_row_shard as _native_shard,
 )
 from atom.plugin.vllm.attention.layer_sparse_mla import (
@@ -121,7 +123,7 @@ def test_plugin_and_native_shards_agree(monkeypatch, tp_size, num_rows):
             lambda: _native_shard(num_rows), tp_size, monkeypatch, native_mod
         )
         plugin = _shards(
-            lambda: _plugin_shard(base, base + num_rows),
+            lambda base=base: _plugin_shard(base, base + num_rows),
             tp_size,
             monkeypatch,
             vllm_dist,

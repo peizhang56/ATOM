@@ -50,7 +50,8 @@ _SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 # reachable row count turns the shard off in the same binary, which is the only
 # way to A/B the shard without also A/Bing the compiler.
 _INDEXER_ROW_SHARD_MIN_ROWS = int(
-    os.environ.get("ATOM_INDEXER_ROW_SHARD_MIN_ROWS", 256))
+    os.environ.get("ATOM_INDEXER_ROW_SHARD_MIN_ROWS", "256")
+)
 
 # Diagnostic only, off unless ATOM_DEBUG_INDEXER_SHARD is set: "the shard did
 # not help" and "the shard did not run" look identical from the outside.
@@ -447,19 +448,18 @@ def sparse_attn_indexer_plugin_mode(
             shard_out, gather_out = _indexer_shard_buffers(
                 shard_stride, topk_tokens, topk_indices.dtype, topk_indices.device
             )
-        if os.environ.get("ATOM_DEBUG_INDEXER_SHARD"):
-            if _indexer_shard_logged < 6:
-                _indexer_shard_logged += 1
-                from vllm.distributed import get_tensor_model_parallel_rank
+        if os.environ.get("ATOM_DEBUG_INDEXER_SHARD") and _indexer_shard_logged < 6:
+            _indexer_shard_logged += 1
+            from vllm.distributed import get_tensor_model_parallel_rank
 
-                # print, not logger: a diagnostic that might be filtered reads
-                # exactly like a branch that never ran.
-                print(
-                    f"[indexer-shard] rank={get_tensor_model_parallel_rank()} "
-                    f"rows=[{prefill_lo},{prefill_hi}) nchunks={len(chunks)} -> "
-                    f"lo={shard_lo} hi={shard_hi} stride={shard_stride}",
-                    flush=True,
-                )
+            # print, not logger: a diagnostic that might be filtered reads
+            # exactly like a branch that never ran.
+            print(
+                f"[indexer-shard] rank={get_tensor_model_parallel_rank()} "
+                f"rows=[{prefill_lo},{prefill_hi}) nchunks={len(chunks)} -> "
+                f"lo={shard_lo} hi={shard_hi} stride={shard_stride}",
+                flush=True,
+            )
         for chunk in chunks:
             # The rows of this chunk that are ours. Tested before the k_fp8
             # gather, so a chunk outside this shard costs nothing at all.
@@ -565,9 +565,7 @@ def sparse_attn_indexer_plugin_mode(
             torch.distributed.all_gather_into_tensor(
                 gather_out, shard_out, group=get_tp_group().device_group
             )
-            topk_indices[prefill_lo:prefill_hi] = gather_out[
-                : prefill_hi - prefill_lo
-            ]
+            topk_indices[prefill_lo:prefill_hi] = gather_out[: prefill_hi - prefill_lo]
 
     if has_decode:
         decode_metadata = indexer_meta.decode
@@ -621,11 +619,7 @@ def sparse_attn_indexer_plugin_mode(
         # (next_n == 1) needs.
         next_n_tile = (
             next_n
-            if (
-                preshuffle_cache
-                and next_n > 1
-                and (chunk_k // 2) % kv_block_size == 0
-            )
+            if (preshuffle_cache and next_n > 1 and (chunk_k // 2) % kv_block_size == 0)
             else 1
         )
         deepgemm_fp8_paged_mqa_logits(
