@@ -12,6 +12,7 @@ forward_impl_sparse handles everything end-to-end: RoPE, KV cache
 write, Q absorption, topk index conversion, sparse kernel, V up-projection.
 """
 
+import inspect
 import logging
 import os
 
@@ -29,6 +30,43 @@ from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
 from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+
+# NextNTile is newer than the oldest aiter this plugin supports, and passing an
+# unknown keyword is a TypeError on every decode step rather than a degraded
+# path -- so the fold is offered only when the installed aiter declares it.
+_AITER_HAS_NEXT_N_TILE = (
+    "NextNTile" in inspect.signature(deepgemm_fp8_paged_mqa_logits).parameters
+)
+
+# The fold keeps one accumulator per folded row live across the KV walk, so
+# `heads * NextNTile` has to fit the 256-VGPR file; past 128 the kernel
+# scratch-spills and runs slower than not folding. aiter asserts this, so a
+# caller that does not respect it takes down the server rather than losing a
+# few percent -- see aiter's deepgemm_fp8_paged_mqa_logits.
+_MQA_LOGITS_FOLD_BUDGET = 128
+
+
+def _mqa_logits_fold(next_n: int, index_heads: int) -> int:
+    """How many speculative rows one KV walk may serve. 1 means do not fold.
+
+    The largest divisor of `next_n` that stays inside the VGPR budget, so a
+    wide head count narrows the fold rather than losing it: at 64 heads and
+    next_n 4 this still folds 2. GLM-5.3 indexes with 32 heads, where next_n 4
+    folds whole. Must divide `next_n` -- the kernel grids over
+    `next_n // NextNTile` and a remainder would drop rows.
+    """
+    if not _AITER_HAS_NEXT_N_TILE or next_n <= 1:
+        return 1
+    return next(
+        (
+            t
+            for t in range(next_n, 0, -1)
+            if next_n % t == 0 and index_heads * t <= _MQA_LOGITS_FOLD_BUDGET
+        ),
+        1,
+    )
+
+
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -615,13 +653,13 @@ def sparse_attn_indexer_plugin_mode(
         # next_n=4, bit-identical.
         #
         # The aiter wrapper rechecks each condition and raises; testing them
-        # here falls back to 1 instead, which is what any unspeculated step
-        # (next_n == 1) needs.
-        next_n_tile = (
-            next_n
-            if (preshuffle_cache and next_n > 1 and (chunk_k // 2) % kv_block_size == 0)
-            else 1
-        )
+        # here falls back to a smaller fold instead, which is what any
+        # unspeculated step (next_n == 1) needs.
+        if preshuffle_cache and (chunk_k // 2) % kv_block_size == 0:
+            next_n_tile = _mqa_logits_fold(next_n, padded_q_fp8_decode_tokens.shape[2])
+        else:
+            next_n_tile = 1
+        fold_kwargs = {"NextNTile": next_n_tile} if _AITER_HAS_NEXT_N_TILE else {}
         deepgemm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
@@ -634,7 +672,7 @@ def sparse_attn_indexer_plugin_mode(
             KVBlockSize=kv_block_size,
             Preshuffle=preshuffle_cache,
             WavePerEU=2,
-            NextNTile=next_n_tile,
+            **fold_kwargs,
         )
 
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
