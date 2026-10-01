@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Hashable
 from contextlib import contextmanager
 from functools import cache
@@ -2135,6 +2136,37 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     md.kv_indptr_hca = hca_indptr
 
 
+_last_target_step = threading.local()
+
+
+def remember_deepseek_v4_target_metadata(attn_metadata, context) -> None:
+    """Keep the ATOM metadata the TARGET forward just ran with.
+
+    The DSpark drafter needs it after the fact: its context KV is derived from
+    the target's ragged batch, so ``write_context_kv`` wants that batch's
+    ``cu_seqlens_q`` spans and the per-request ``state_slot_out`` the target's
+    builder allocated -- the draft has its own KV plane, not its own slot
+    numbering. vLLM's speculator runs *after* the target's forward context has
+    exited, so reading it off vLLM's context there returns nothing.
+
+    Deliberately not cleared on exit: the value is wanted precisely after the
+    forward ends. It is replaced every target step, and the speculator always
+    runs within the step that set it, so the drafter never sees a stale one.
+    Thread-local because each TP worker has its own.
+    """
+    _last_target_step.value = (attn_metadata, context)
+
+
+def get_deepseek_v4_target_metadata():
+    """``(attn_metadata, context)`` from this step's target forward, or None.
+
+    The ``Context`` comes along because ``write_context_kv`` reads
+    ``scheduled_bs`` off it to size the per-request spans, and that is the
+    target batch's count -- not the draft block's.
+    """
+    return getattr(_last_target_step, "value", None)
+
+
 def get_deepseek_v4_proxy_metadata_from_vllm_context(
     layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
 ):
@@ -2331,6 +2363,11 @@ def atom_deepseek_v4_forward_context(
         ),
         input_ids=input_ids,
     )
+    if not force_dummy and proxy_layer_name == ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME:
+        # The target's step: keep what it ran with, because the DSpark drafter
+        # needs it once vLLM's speculator runs -- after this context has exited.
+        # See `remember_deepseek_v4_target_metadata`.
+        remember_deepseek_v4_target_metadata(attn_metadata, context)
     set_forward_context(
         attn_metadata=attn_metadata,
         atom_config=atom_config,
