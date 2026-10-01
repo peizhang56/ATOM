@@ -78,6 +78,48 @@ def _demote_piecewise_cudagraph(vllm_config) -> None:
     )
 
 
+def _note_missing_dp_attention(vllm_config) -> None:
+    """Say once that this path has no DP attention, and what it costs.
+
+    MLA keeps ONE latent per token, shared by every head, so tensor parallelism
+    does not shard the KV read: each of the TP ranks reads the whole
+    per-request cache every step (~662 MB at 115k context on V4-Pro, counting
+    the sparse-index plane). ATOM native answers that with
+    ``--enable-dp-attention``, which gives each rank all the heads and 1/N of
+    the requests. Plugin mode cannot: ``_generate_atom_config_from_vllm_config``
+    hardcodes ``enable_dp_attention=False`` because the feature is a rank-layout
+    decision in ATOM's own engine, and plugin mode runs vLLM's ``GPUModelRunner``
+    instead.
+
+    Measured on MI355X, DeepSeek-V4-Pro-0813 TP8, ISL 115k / OSL 1k, DSpark 7:
+    removing ``--enable-dp-attention --enable-tbo`` from the native arm raises
+    its decode step time 1.65x / 1.87x / 2.12x at concurrency 32 / 64 / 128 and
+    lands it within 5% of this path's. The plugin's decode is at parity; the
+    whole gap is the two flags. The cost scales with context length and
+    concurrency, so it is near zero on short-context serving -- which is why
+    ATOM's own out-of-tree benchmark for this model (1024x1024, 8192x1024)
+    never saw it.
+
+    ``info``, not a warning: nothing here is misconfigured and there is no
+    action to take yet. It exists so the next long-context measurement starts
+    from the explanation rather than rediscovering it.
+    """
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    world = getattr(parallel_config, "tensor_parallel_size", 1) or 1
+    if world <= 1:
+        return  # Single rank reads its own cache once; nothing is replicated.
+    logger.info(
+        "ATOM DeepSeek-V4: no DP attention on the vLLM plugin path, so each of "
+        "the %d TP ranks reads every request's full MLA latent and index plane "
+        "each decode step. Native's --enable-dp-attention + --enable-tbo are "
+        "worth 1.65x-2.12x of decode step time at ISL 115k (concurrency "
+        "32-128); the cost falls to ~0 at short context. Not a "
+        "misconfiguration -- the feature lives in ATOM's engine, which plugin "
+        "mode replaces with vLLM's model runner.",
+        world,
+    )
+
+
 def _enforce_deepseek_v4_constraints(vllm_config) -> None:
     """Apply V4-specific plugin constraints.
 
@@ -103,6 +145,7 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
     if mc is None or not _is_deepseek_v4(mc):
         return
 
+    _note_missing_dp_attention(vllm_config)
     _demote_piecewise_cudagraph(vllm_config)
 
     cache_config = getattr(vllm_config, "cache_config", None)

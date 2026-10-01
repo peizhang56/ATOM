@@ -10,11 +10,18 @@ decoding, so the draft caps the whole request's hit at whatever stale run
 survived eviction (17.4% observed, against 84.9% for ATOM native).
 
 Skipping the lookup is safe: ``_roll_back_prefix_hit`` re-forwards the last
-512 tokens of every hit and the draft reads only the last 128.
+``max(win_with_spec, index_topk)`` tokens of every hit -- 1024 on
+DeepSeek-V4-Pro-0813, 512 on V4-Flash-0731, never fewer than the window -- and
+the draft reads only the last 128.
 
 Registered through vLLM's ``@register_kv_cache_spec`` seam rather than a
 coordinator monkeypatch, so page size, memory accounting and allocation are
-inherited unchanged. The hit-rate recovery is not yet measured on hardware.
+inherited unchanged.
+
+Measured on MI355X, DeepSeek-V4-Pro-0813 TP8 at ISL 115k: the prefix-cache hit
+rate reaches **88.98 %** from concurrency 32 up, against the 17.4 % that
+motivated this patch and ATOM native's 89.93 % on the same workload. The
+recovery is real and the remaining ~1 pp is the rollback above.
 """
 
 import dataclasses
