@@ -77,7 +77,15 @@ _DEEPSEEK_V4_ARCHES: set[str] = {
     # `models/deepseek_v4_dspark.py`.
     "DSparkDraftModel",
 }
-_DEEPSEEK_V4_MTP_ARCHES: set[str] = _DEEPSEEK_V4_ARCHES - {_DEEPSEEK_V4_ARCH}
+# Every V4 arch that is a DRAFT rather than the target. These get the draft
+# proxy layer (`deepseek_v4_draft_proxy_layer_name`) instead of the target's.
+_DEEPSEEK_V4_DRAFT_ARCHES: set[str] = _DEEPSEEK_V4_ARCHES - {_DEEPSEEK_V4_ARCH}
+# ...and of those, the ones that take the MTP forward contract, which needs the
+# target's hidden states threaded in. The DSpark block drafter does NOT: vLLM's
+# speculator hands it a laid-out block and it takes the plain
+# `(input_ids, positions)` forward, so it must not be routed through
+# `_deepseek_v4_mtp_forward_kwargs`.
+_DEEPSEEK_V4_MTP_ARCHES: set[str] = _DEEPSEEK_V4_DRAFT_ARCHES - {"DSparkDraftModel"}
 
 
 def _probe_v4_routed_expert_dtype(model_path) -> str | None:
@@ -177,7 +185,13 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
 
 # DSpark drafts ship as their own checkpoint, so like EAGLE3 they are built from
 # the draft's hf_config and their layers are numbered past the target's.
-_DSPARK_DRAFT_ARCHS: frozenset[str] = frozenset({"K3DSparkModel"})
+# Architectures that are a DSpark DRAFT rather than a DSpark target. Without an
+# entry here the wrapper takes the target branch and tries to expose the EAGLE3
+# aux-hidden-state surface on a draft, which has none -- see
+# `_enable_eagle3_target_interface`.
+_DSPARK_DRAFT_ARCHS: frozenset[str] = frozenset(
+    {"K3DSparkModel", "DSparkDraftModel"}
+)
 
 
 def _normalize_atom_model_arch(model_arch: str) -> str:
@@ -575,6 +589,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # (see `forward`). Other ATOM models follow vLLM's contract directly.
         self._is_deepseek_v4 = self.model_arch in _DEEPSEEK_V4_ARCHES
         self._is_deepseek_v4_mtp = self.model_arch in _DEEPSEEK_V4_MTP_ARCHES
+        # Distinct from the above: every V4 draft needs the DRAFT proxy layer,
+        # but only the MTP ones take the MTP forward contract.
+        self._is_deepseek_v4_draft = self.model_arch in _DEEPSEEK_V4_DRAFT_ARCHES
         if self._is_deepseek_v4:
             from atom.plugin.vllm.deepseek_v4_bridge import (
                 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
@@ -584,7 +601,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
             self._deepseek_v4_proxy_layer_name = (
                 deepseek_v4_draft_proxy_layer_name(self.atom_config.hf_config)
-                if self._is_deepseek_v4_mtp
+                if self._is_deepseek_v4_draft
                 else ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
             )
             register_deepseek_v4_proxy_layer(
