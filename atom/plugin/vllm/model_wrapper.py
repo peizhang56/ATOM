@@ -38,6 +38,7 @@ from atom.plugin.config import (
     generate_atom_config_for_plugin_mode,
 )
 from atom.plugin.prepare import _set_framework_backbone
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -1036,6 +1037,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
+        if envs.ATOM_LOG_SPEC_SEAM:
+            _log_spec_seam(self, hidden_states)
+
         if self.model_arch == "DeepSeekMTPModel":
             # vLLM's DeepSeek-MTP contract wants (sample_hidden, recycle_hidden).
             # DeepSeekMultiTokenPredictorLayer.forward already returns the
@@ -1186,3 +1190,60 @@ class ATOMForConditionalGeneration(
 
     def get_mrope_input_positions(self, input_tokens, mm_features):
         return self.model.get_mrope_input_positions(input_tokens, mm_features)
+
+
+def _log_spec_seam(wrapper, hidden_states) -> None:
+    """Log the ATOM-target -> vLLM-drafter seam, per forward.
+
+    This is the one boundary in plugin-mode speculative decoding where the two
+    codebases meet: ATOM computes the target's hidden states (and, for
+    EAGLE3/DSpark, the per-layer aux states averaged over the mHC dimension),
+    and vLLM's speculator turns them into draft tokens. If the drafter's
+    acceptance depends on batch size, either those states are batch-dependent
+    -- which DeepSeek-V4 is specified not to be (paper 3.3) -- or the drafter
+    is at fault. Nothing currently reports which.
+
+    What is logged, per step: the batch and token counts, and a cheap
+    fingerprint (mean / std / max-abs) of the target hidden and of every aux
+    tensor. Those are summary statistics over the WHOLE batch, so they do not
+    prove per-request invariance by themselves -- they are there to catch a
+    gross shift with batch size, and to confirm the aux tensors are being
+    produced at all and have the shape the drafter expects.
+
+    Costs a device-to-host sync per forward, so it is off unless
+    ATOM_LOG_SPEC_SEAM=1. Diagnostic only.
+    """
+    try:
+        aux = None
+        if isinstance(hidden_states, tuple):
+            hidden, aux = hidden_states[0], hidden_states[1]
+        else:
+            hidden = hidden_states
+
+        def stats(t):
+            f = t.float()
+            return f"n={tuple(t.shape)} mean={f.mean():+.4e} std={f.std():.4e} absmax={f.abs().max():.4e}"
+
+        ctx = ""
+        try:
+            from vllm.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+
+            if is_forward_context_available():
+                md = get_forward_context().attn_metadata
+                if isinstance(md, dict) and md:
+                    one = next(iter(md.values()))
+                    ctx = f" num_reqs={getattr(one, 'num_reqs', '?')}"
+        except Exception:
+            pass
+
+        parts = [f"target {stats(hidden)}"]
+        if aux is not None:
+            parts += [f"aux[{i}] {stats(a)}" for i, a in enumerate(aux)]
+        else:
+            parts.append("aux=NONE (drafter will fall back to last_hidden_states)")
+        logger.info("ATOM spec seam:%s %s", ctx, " | ".join(parts))
+    except Exception as exc:  # diagnostic only; never break a forward
+        logger.warning("ATOM spec-seam probe failed once: %r", exc)

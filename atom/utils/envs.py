@@ -457,6 +457,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_CHECK_MARKOV_BOUNDS": lambda: _flag_env(
         "ATOM_DSPARK_CHECK_MARKOV_BOUNDS"
     ),
+    # Log the ATOM-target -> vLLM-drafter seam once per forward: batch size and
+    # a mean/std/absmax fingerprint of the target hidden state and of each aux
+    # tensor the drafter consumes.
+    #
+    # That seam is the only place plugin-mode speculative decoding crosses
+    # codebases, and it is unreported: ATOM computes the states, vLLM's
+    # speculator drafts from them. When acceptance falls with batch size -- as
+    # it does on DeepSeek-V4-Pro at ISL 115k, 3.21 tok/step at a running batch
+    # of 32 down to 2.38 at 128 -- this says whether the states handed over
+    # shifted, or whether the drafter alone is responsible.
+    #
+    # Summary statistics over the whole batch, so they catch a gross shift, not
+    # a per-request one; pair with a batch-invariance check for that. Costs a
+    # device-to-host sync per forward, so OFF by default.
+    "ATOM_LOG_SPEC_SEAM": lambda: _flag_env("ATOM_LOG_SPEC_SEAM"),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft
