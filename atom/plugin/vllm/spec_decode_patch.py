@@ -183,31 +183,50 @@ def _patch_dspark_markov_embed_bounds() -> None:
 
 
 def _count_markov_out_of_range(model, token_ids: torch.Tensor, limit: int) -> None:
-    """Tally clamped ids on ``model`` and log the running total.
+    """Tally clamped ids in a device counter, and log it when it is safe to read.
 
-    Logged on a power-of-two schedule rather than every call: a drafting step
-    runs this K times per batch, and a defect that fires at all fires often, so
-    the first few reports arrive immediately and the rate stops flooding.
-    Totals are per process; with TP every rank reports its own.
+    The accumulate has to be capture-safe and the read must not be. DSpark's
+    draft decode runs inside a FULL_DECODE_ONLY cudagraph, where a ``.item()``
+    is ``hipErrorStreamCaptureUnsupported`` -- and, worse, a Python-side check
+    would never run at all on replay, which is exactly the steps this is here
+    to watch. So the `+=` is an ordinary device op that gets *captured* and
+    re-executed on every replay, and the host read happens on whatever eager
+    step comes next (this workload interleaves chunked prefill constantly).
+
+    Logged on a power-of-two schedule of non-empty reads: a defect that fires at
+    all fires often, so the first reports arrive immediately and the rate then
+    stops flooding. The counter is per process; with TP every rank has its own.
     """
-    bad = int(((token_ids < 0) | (token_ids >= limit)).sum().item())
-    if not bad:
+    counter = getattr(model, "_atom_markov_oor", None)
+    if counter is None:
+        if torch.cuda.is_current_stream_capturing():
+            # Allocating during capture is as illegal as reading. Warmup runs
+            # eagerly first, so this is a cold-start corner, not the steady state.
+            return
+        counter = torch.zeros((), dtype=torch.int64, device=token_ids.device)
+        model._atom_markov_oor = counter
+
+    # Captured on replay along with everything else in the draft graph.
+    counter += ((token_ids < 0) | (token_ids >= limit)).sum()
+
+    if torch.cuda.is_current_stream_capturing():
         return
-    total = getattr(model, "_atom_markov_clamped", 0) + bad
-    calls = getattr(model, "_atom_markov_clamp_calls", 0) + 1
-    model._atom_markov_clamped = total
-    model._atom_markov_clamp_calls = calls
-    if calls & (calls - 1):  # not a power of two
+    total = int(counter.item())
+    if total == getattr(model, "_atom_markov_oor_reported", 0):
+        return  # nothing new since the last read
+    reads = getattr(model, "_atom_markov_oor_reads", 0) + 1
+    model._atom_markov_oor_reads = reads
+    model._atom_markov_oor_reported = total
+    if reads & (reads - 1):  # not a power of two
         return
     logger.warning(
-        "ATOM plugin: DSpark Markov embedding clamped %d of %d id(s) this call "
-        "(%d clamped across %d call(s) with any). Every clamped id drafts a "
-        "WRONG token, which costs acceptance silently -- it is not a fault and "
-        "not a wrong answer. Valid ids are [0, %d).",
-        bad,
-        token_ids.numel(),
+        "ATOM plugin: DSpark Markov embedding has clamped %d id(s) so far "
+        "(%d read(s) saw new ones; %d id(s) in this call). Every clamped id "
+        "drafts a WRONG token, which costs acceptance silently -- it is not a "
+        "fault and not a wrong answer. Valid ids are [0, %d).",
         total,
-        calls,
+        reads,
+        token_ids.numel(),
         limit,
     )
 

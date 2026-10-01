@@ -92,13 +92,14 @@ def _note_missing_dp_attention(vllm_config) -> None:
     instead.
 
     Measured on MI355X, DeepSeek-V4-Pro-0813 TP8, ISL 115k / OSL 1k, DSpark 7:
-    removing ``--enable-dp-attention --enable-tbo`` from the native arm raises
-    its decode step time 1.65x / 1.87x / 2.12x at concurrency 32 / 64 / 128 and
-    lands it within 5% of this path's. The plugin's decode is at parity; the
-    whole gap is the two flags. The cost scales with context length and
-    concurrency, so it is near zero on short-context serving -- which is why
-    ATOM's own out-of-tree benchmark for this model (1024x1024, 8192x1024)
-    never saw it.
+    removing ``--enable-dp-attention`` from the native arm raises its decode
+    step time **1.95x at concurrency 64 and 2.31x at 128** and lands it within
+    5% of this path's -- at 128 this path is 4% faster. The plugin's decode is
+    at parity; the whole gap is that one feature. (``--enable-tbo`` was
+    measured separately at 0.96x / 0.92x, i.e. a net loss, so it is not part of
+    this.) The cost scales with context length and concurrency and is near zero
+    on short-context serving -- which is why ATOM's own out-of-tree benchmark
+    for this model (1024x1024, 8192x1024) never saw it.
 
     ``info``, not a warning: nothing here is misconfigured and there is no
     action to take yet. It exists so the next long-context measurement starts
@@ -111,11 +112,11 @@ def _note_missing_dp_attention(vllm_config) -> None:
     logger.info(
         "ATOM DeepSeek-V4: no DP attention on the vLLM plugin path, so each of "
         "the %d TP ranks reads every request's full MLA latent and index plane "
-        "each decode step. Native's --enable-dp-attention + --enable-tbo are "
-        "worth 1.65x-2.12x of decode step time at ISL 115k (concurrency "
-        "32-128); the cost falls to ~0 at short context. Not a "
-        "misconfiguration -- the feature lives in ATOM's engine, which plugin "
-        "mode replaces with vLLM's model runner.",
+        "each decode step. Native's --enable-dp-attention is worth 1.95x "
+        "(concurrency 64) to 2.31x (128) of decode step time at ISL 115k; the "
+        "cost falls to ~0 at short context. Not a misconfiguration -- the "
+        "feature lives in ATOM's engine, which plugin mode replaces with "
+        "vLLM's model runner.",
         world,
     )
 
