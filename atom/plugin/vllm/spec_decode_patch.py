@@ -143,6 +143,13 @@ def _patch_dspark_markov_embed_bounds() -> None:
     Clamped at the point of use, not at the seed: ``_sample_sequential``
     reassigns ``prev`` on every one of the K steps. No accuracy cost -- the
     target verifies every draft token, so a bad draft costs acceptance only.
+
+    "Acceptance only" is exactly why the clamp is worth counting. A clamp that
+    fires neither faults nor corrupts; it drafts a wrong token, which is
+    indistinguishable from a drafter that is simply doing badly. Set
+    ``ATOM_DSPARK_CHECK_MARKOV_BOUNDS=1`` to make it say so. Off by default --
+    the check is a device reduction plus a host read per drafting step, i.e. a
+    sync on the decode critical path.
     """
     try:
         from vllm.models.deepseek_v4.amd.dspark import DSparkDeepseekV4ForCausalLM
@@ -153,12 +160,16 @@ def _patch_dspark_markov_embed_bounds() -> None:
     if getattr(original_markov_embed, "_atom_markov_bounds_patched", False):
         return
 
+    check_bounds = envs.ATOM_DSPARK_CHECK_MARKOV_BOUNDS
+
     @functools.wraps(original_markov_embed)
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         limit = getattr(self, "_atom_markov_num_rows", None)
         if limit is None:
             limit = self.model.markov_head.markov_w1.num_embeddings
             self._atom_markov_num_rows = limit
+        if check_bounds:
+            _count_markov_out_of_range(self, token_ids, limit)
         # Out-of-place: `prev` is the caller's live loop variable.
         return original_markov_embed(self, token_ids.clamp(0, limit - 1))
 
@@ -166,7 +177,38 @@ def _patch_dspark_markov_embed_bounds() -> None:
     DSparkDeepseekV4ForCausalLM.markov_embed = markov_embed
     logger.info(
         "ATOM plugin: bounds-checking the DSpark Markov embedding gather "
-        "(an out-of-range draft id would fault the GPU under async scheduling)."
+        "(an out-of-range draft id would fault the GPU under async scheduling)%s.",
+        "; counting clamps (ATOM_DSPARK_CHECK_MARKOV_BOUNDS)" if check_bounds else "",
+    )
+
+
+def _count_markov_out_of_range(model, token_ids: torch.Tensor, limit: int) -> None:
+    """Tally clamped ids on ``model`` and log the running total.
+
+    Logged on a power-of-two schedule rather than every call: a drafting step
+    runs this K times per batch, and a defect that fires at all fires often, so
+    the first few reports arrive immediately and the rate stops flooding.
+    Totals are per process; with TP every rank reports its own.
+    """
+    bad = int(((token_ids < 0) | (token_ids >= limit)).sum().item())
+    if not bad:
+        return
+    total = getattr(model, "_atom_markov_clamped", 0) + bad
+    calls = getattr(model, "_atom_markov_clamp_calls", 0) + 1
+    model._atom_markov_clamped = total
+    model._atom_markov_clamp_calls = calls
+    if calls & (calls - 1):  # not a power of two
+        return
+    logger.warning(
+        "ATOM plugin: DSpark Markov embedding clamped %d of %d id(s) this call "
+        "(%d clamped across %d call(s) with any). Every clamped id drafts a "
+        "WRONG token, which costs acceptance silently -- it is not a fault and "
+        "not a wrong answer. Valid ids are [0, %d).",
+        bad,
+        token_ids.numel(),
+        total,
+        calls,
+        limit,
     )
 
 

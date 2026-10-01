@@ -444,6 +444,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # Count how often the vLLM-plugin DSpark draft's Markov embedding gather is
+    # handed an out-of-range token id, and log it.
+    #
+    # `_patch_dspark_markov_embed_bounds` (atom/plugin/vllm/spec_decode_patch.py)
+    # clamps those ids because an unguarded `F.embedding` would fault the GPU.
+    # A clamp that fires does NOT fault and does NOT produce a wrong answer --
+    # the target verifies every draft token -- it silently drafts the wrong
+    # token and costs acceptance, which is indistinguishable from a drafter
+    # that is merely doing badly. On MI355X at ISL 115k the plugin arm's
+    # acceptance falls from 3.21 to 2.38 tok/step between concurrency 32 and
+    # 128 while ATOM native holds ~3.3 at every point, and this clamp is the
+    # one place in the draft path where a defect degrades acceptance in
+    # silence. The counter is how that hypothesis gets ruled in or out.
+    #
+    # OFF by default and deliberately so: the check is a device-side reduction
+    # plus a host read per drafting step, i.e. a sync on the decode critical
+    # path. Diagnostic only -- turn it on for a run, read the log, turn it off.
+    "ATOM_DSPARK_CHECK_MARKOV_BOUNDS": lambda: _flag_env(
+        "ATOM_DSPARK_CHECK_MARKOV_BOUNDS"
+    ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft
