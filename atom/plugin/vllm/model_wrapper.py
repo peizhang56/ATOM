@@ -1079,6 +1079,22 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         from atom.model_loader.loader import load_model_in_plugin_mode
 
         is_mtp_draft_model = self.model_arch in _MTP_DRAFT_MODEL_ARCHES
+        # Does this draft read its weights out of the checkpoint's `mtp.*`
+        # namespace? `WeightNames.resolve` DROPS every name containing `mtp`
+        # unless `spec_decode` is set, and only then applies the model's
+        # `remap_mtp_weight_name` (weight_names.py:169,177). DeepSeek-V4's
+        # DSpark drafter ships inside the TARGET checkpoint under `mtp.*` like
+        # the MTP drafts do, so without this all 97 of its parameters stay at
+        # their init values -- it drafts from noise, the target rejects every
+        # token, and the only symptom is acceptance pinned at 0 %.
+        #
+        # Keyed on the method rather than an arch list so a new drafter opts in
+        # by declaring the remap it needs anyway. Kimi-K3's DSpark draft does
+        # not declare one (its parameter names match its checkpoint 1:1) and is
+        # unaffected.
+        reads_mtp_namespace = is_mtp_draft_model or callable(
+            getattr(self.model, "remap_mtp_weight_name", None)
+        )
         draft_hf_config = None
         draft_model_path = None
         if is_mtp_draft_model:
@@ -1110,7 +1126,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             model=self.model,
             config=self.atom_config,
             prefix="model.",
-            spec_decode=is_mtp_draft_model,
+            spec_decode=reads_mtp_namespace,
             hf_config_override=draft_hf_config,
             model_name_or_path_override=draft_model_path,
         )
