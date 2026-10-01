@@ -71,6 +71,11 @@ _DEEPSEEK_V4_ARCHES: set[str] = {
     _DEEPSEEK_V4_ARCH,
     "DeepSeekV4MTPModel",
     "DeepseekV4MTPModel",
+    # The DSpark block drafter is a V4 draft like the MTP ones: it needs the
+    # same proxy-layer registration and ATOM forward context, and it owns its
+    # own rolling KV rather than using vLLM's paged draft pool. See
+    # `models/deepseek_v4_dspark.py`.
+    "DSparkDraftModel",
 }
 _DEEPSEEK_V4_MTP_ARCHES: set[str] = _DEEPSEEK_V4_ARCHES - {_DEEPSEEK_V4_ARCH}
 
@@ -149,6 +154,9 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
     "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
+    "DSparkDraftModel": (
+        "atom.plugin.vllm.models.deepseek_v4_dspark:DeepseekV4DSparkDraft"
+    ),
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
     "Qwen3NextMTP": "atom.models.qwen3_next_mtp:Qwen3NextMTP",
