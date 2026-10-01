@@ -34,16 +34,18 @@ def test_dspark_draft_counts_as_a_v4_arch():
     """It needs the V4 proxy-layer registration and ATOM forward context, the
     same as the MTP drafts -- that is what `_DEEPSEEK_V4_ARCHES` gates."""
     from atom.plugin.vllm.model_wrapper import (
-        _DEEPSEEK_V4_ARCH,
         _DEEPSEEK_V4_ARCHES,
+        _DEEPSEEK_V4_DRAFT_ARCHES,
         _DEEPSEEK_V4_MTP_ARCHES,
     )
 
     assert "DSparkDraftModel" in _DEEPSEEK_V4_ARCHES
-    # The MTP set is ARCHES minus the target, so the draft lands there too and
-    # gets the *draft* proxy layer rather than the target's.
-    assert "DSparkDraftModel" in _DEEPSEEK_V4_MTP_ARCHES
-    assert "DSparkDraftModel" != _DEEPSEEK_V4_ARCH
+    # A V4 DRAFT, so it gets the draft proxy layer rather than the target's...
+    assert "DSparkDraftModel" in _DEEPSEEK_V4_DRAFT_ARCHES
+    # ...but NOT an MTP draft: vLLM's speculator hands it a laid-out block and
+    # it takes the plain (input_ids, positions) forward. Routing it through the
+    # MTP contract fails with "MTP draft forward requires hidden_states".
+    assert "DSparkDraftModel" not in _DEEPSEEK_V4_MTP_ARCHES
 
 
 def _anchor_view(input_ids: torch.Tensor, positions: torch.Tensor, width: int):
@@ -95,20 +97,76 @@ def test_block_width_falls_back_to_one_without_a_speculative_config():
     assert vllm_block_width(_Cfg()) == 1
 
 
-def test_forward_rejects_a_ragged_token_count():
-    """A token count that is not a multiple of the block width means vLLM's
-    layout assumption no longer holds; fail loudly rather than reshape garbage
-    into anchors."""
+def test_forward_rejects_an_empty_batch():
     from atom.plugin.vllm.models.deepseek_v4_dspark import DeepseekV4DSparkDraft
 
     draft = DeepseekV4DSparkDraft.__new__(DeepseekV4DSparkDraft)
     draft.vllm_block_width = 8
-    with pytest.raises(ValueError, match="not a multiple"):
+    with pytest.raises(ValueError, match="empty batch"):
         DeepseekV4DSparkDraft.forward(
             draft,
-            torch.zeros(23, dtype=torch.long),
-            torch.zeros(23, dtype=torch.long),
+            torch.zeros(0, dtype=torch.long),
+            torch.zeros(0, dtype=torch.long),
         )
+
+
+def test_forward_truncates_for_a_batch_shorter_than_one_block():
+    """Memory profiling sizes the draft by a token budget, which can be smaller
+    than one block. Draft one block and return only the rows vLLM asked for."""
+    from atom.plugin.vllm.models.deepseek_v4_dspark import DeepseekV4DSparkDraft
+
+    width, dim, total = 8, 4, 7
+    draft = _StubDraft(width, dim)
+    out = draft.forward(
+        torch.zeros(total, dtype=torch.long), torch.zeros(total, dtype=torch.long)
+    )
+    assert out.shape == (total, dim)
+    # One block drafted, from the only anchor available.
+    assert draft.seen["anchors"].numel() == 1
+
+
+class _StubDraft:
+    """`DeepseekV4DSparkDraft.forward` with the compiled backbone stubbed."""
+
+    def __init__(self, width, dim):
+        self.vllm_block_width = width
+        self.dim = dim
+        self.seen = {}
+
+    def block_backbone(self, anchors, positions, num_draft):
+        self.seen["anchors"] = anchors.clone()
+        self.seen["num_draft"] = num_draft
+        return torch.ones(anchors.numel() * num_draft, self.dim), None
+
+    def forward(self, input_ids, positions):
+        from atom.plugin.vllm.models.deepseek_v4_dspark import DeepseekV4DSparkDraft
+
+        return DeepseekV4DSparkDraft.forward(self, input_ids, positions)
+
+
+def test_forward_drafts_whole_blocks_and_zero_fills_a_padded_tail():
+    """Dummy / profiling / cudagraph-capture runs arrive padded to a token
+    count that need not divide by the block width. Reshaping across that
+    boundary would take an anchor from the middle of someone's block, so the
+    tail is zero-filled instead -- and the returned row count still matches the
+    input, which vLLM indexes by."""
+    width, dim = 8, 4
+    draft = _StubDraft(width, dim)
+    seen = draft.seen
+    total = width * 3 + 5  # three whole blocks plus padding
+    ids = torch.zeros(total, dtype=torch.long)
+    anchors = torch.tensor([11, 22, 33])
+    for b, a in enumerate(anchors):
+        ids[b * width] = a
+
+    out = draft.forward(ids, torch.zeros(total, dtype=torch.long))
+
+    torch.testing.assert_close(seen["anchors"], anchors)
+    assert seen["num_draft"] == width
+    # Row count matches the padded input, and only the padding is zeroed.
+    assert out.shape == (total, dim)
+    assert out[: width * 3].eq(1).all()
+    assert out[width * 3 :].eq(0).all()
 
 
 def test_forward_refuses_to_guess_an_unset_block_width():
