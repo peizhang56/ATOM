@@ -87,7 +87,7 @@ class DeepseekV4DSparkDraft(DeepseekV4DSparkBase):
     continuous batching, which is what ``IndexerVllm`` adds.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, layer_offset: int | None = None, **kwargs):
         original_attn_cls = deepseek_v4_base.DeepseekV4Attention
         original_indexer_cls = deepseek_v4_base.Indexer
         deepseek_v4_base.DeepseekV4Attention = DeepseekV4AttentionVllm
@@ -97,6 +97,24 @@ class DeepseekV4DSparkDraft(DeepseekV4DSparkBase):
         finally:
             deepseek_v4_base.DeepseekV4Attention = original_attn_cls
             deepseek_v4_base.Indexer = original_indexer_cls
+        # `layer_offset` is how the plugin tells a STANDALONE draft where the
+        # target's layers end, so the draft's own layer names do not collide in
+        # vLLM's static_forward_context. V4's DSpark already does that for
+        # itself -- its stages are built as `DSparkLayer(args.n_layers + i,
+        # ...)` -- so the argument is absorbed rather than forwarded. K3's draft
+        # takes it because its stages number from zero.
+        #
+        # Checked rather than ignored: if vLLM ever reports a different target
+        # depth than the config the draft was built from, the two numberings
+        # disagree and the draft's layers alias the target's, which would be a
+        # silent cache collision.
+        if layer_offset is not None and int(layer_offset) != int(self.args.n_layers):
+            raise ValueError(
+                f"DSpark draft layer_offset={layer_offset} from vLLM disagrees "
+                f"with the target depth this draft numbered itself from "
+                f"({self.args.n_layers}). Its stages would alias the target's "
+                "layer names in static_forward_context."
+            )
         # Set by the wrapper from vLLM's speculative config; see `forward`.
         self.vllm_block_width: int | None = None
 
@@ -125,15 +143,31 @@ class DeepseekV4DSparkDraft(DeepseekV4DSparkBase):
                 "DeepseekV4DSparkDraft.vllm_block_width was never set; "
                 "DeepseekV4DSparkVllm.__init__ is what sets it."
             )
-        if input_ids.numel() % T:
-            raise ValueError(
-                f"DSpark draft got {input_ids.numel()} tokens, not a multiple "
-                f"of the block width {T}. vLLM lays out exactly "
-                "1 + num_speculative_tokens per request."
-            )
-        anchors = input_ids.view(-1, T)[:, 0]
-        anchor_positions = positions.view(-1, T)[:, 0]
-        normed, _hc_hidden = self.block_backbone(anchors, anchor_positions, T)
+        total = int(input_ids.numel())
+        if total < 1:
+            raise ValueError("DSpark draft got an empty batch.")
+        # A REAL step is exactly `num_reqs * T` and every branch below is a
+        # no-op for it. Dummy, memory-profiling and cudagraph-capture runs are
+        # not: vLLM sizes those by a token budget, so they arrive padded to a
+        # count that need not divide by T, and can even be shorter than one
+        # block. Serve them by drafting whole blocks and reconciling the row
+        # count, rather than reshaping across a block boundary -- which would
+        # take an anchor from the middle of someone's block and silently draft
+        # from the wrong token.
+        num_blocks = max(1, total // T)
+        anchor_idx = torch.arange(num_blocks, device=input_ids.device) * T
+        anchor_idx = anchor_idx.clamp(max=total - 1)
+        normed, _hc_hidden = self.block_backbone(
+            input_ids[anchor_idx], positions[anchor_idx], T
+        )
+        # vLLM indexes the result by its own token count, so return that many
+        # rows: truncate a short batch's block, zero-fill a padded tail.
+        produced = normed.shape[0]
+        if produced > total:
+            return normed[:total]
+        if produced < total:
+            pad = normed.new_zeros((total - produced, normed.shape[-1]))
+            return torch.cat([normed, pad], dim=0)
         return normed
 
     def write_combined_context_kv(
@@ -149,6 +183,18 @@ class DeepseekV4DSparkDraft(DeepseekV4DSparkBase):
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.attn.layer_name for layer in self.context_layers]
+
+    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``[N, dim] -> [N, vocab]`` off the shared head.
+
+        Not ``lm_head(hidden_states)``: V4's head is a ``ParallelHead`` whose
+        ``forward`` also takes the mHC reduction arguments
+        (``hc_fn``/``hc_scale``/``hc_base``/``norm``), because the target calls
+        it with the un-reduced stack. The block drafter has already reduced and
+        normed, so it wants the plain projection -- which is ``get_logits``,
+        the same entry ATOM's native block sampler uses.
+        """
+        return self.model.head.get_logits(hidden_states)
 
 
 class DeepseekV4DSparkVllm(ATOMMoEForCausalLM):
@@ -220,7 +266,7 @@ class DeepseekV4DSparkVllm(ATOMMoEForCausalLM):
             self.model.write_combined_context_kv(hidden_states, positions)
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(hidden_states)
+        return self.model.compute_draft_logits(hidden_states)
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self._markov_head().markov_w1(token_ids)
@@ -250,7 +296,23 @@ class DeepseekV4DSparkVllm(ATOMMoEForCausalLM):
         return draft_token_ids
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
-        return self.model.get_draft_kv_cache_layer_names()
+        """The names vLLM knows, which is the proxy layer -- NOT ATOM's own.
+
+        vLLM's speculator maps each returned name to a KV cache group
+        (``name_to_gid[name]``) to pick that layer's context slot mapping, so a
+        name it never registered is a ``KeyError``. ATOM's internal stages
+        (``mtp.0.attn`` ...) are exactly that: the draft's KV lives in ATOM's
+        own rolling ring behind one opaque proxy layer, which is what was
+        registered. One name, and the slot mapping it selects goes unused --
+        see :meth:`precompute_and_store_context_kv`.
+        """
+        proxy_layer_name = self.__dict__.get("_deepseek_v4_proxy_layer_name")
+        if proxy_layer_name is None:
+            raise RuntimeError(
+                "DSpark draft has no V4 proxy layer name; "
+                "`DSparkDraftModel` must be in `_DEEPSEEK_V4_ARCHES`."
+            )
+        return [proxy_layer_name]
 
     def _markov_head(self):
         """The Markov head lives on the LAST backbone stage (checkpoint

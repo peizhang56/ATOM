@@ -619,6 +619,42 @@ def _share_atom_draft_with_target(draft_wrapper, target_model) -> None:
     )
 
 
+def _patch_dspark_draft_sharing() -> None:
+    """Share the target's embed/head with an ATOM-owned DSpark draft.
+
+    ``_patch_vllm_llm_base_model_sharing`` below hooks
+    ``SpecDecodeBaseProposer.load_model``, which DSpark never reaches: its
+    speculator is ``DSparkSpeculator`` and it loads through
+    ``load_draft_model`` -> ``load_dspark_model``. Without this an ATOM DSpark
+    draft starts with ``embed``/``head`` unset and the first block forward dies
+    on ``'NoneType' object is not callable`` inside the compiled region.
+
+    Hooked on the speculator method rather than ``load_dspark_model`` itself
+    because the speculator imports that symbol by name
+    (``from ...dspark.utils import load_dspark_model``), so rebinding it in its
+    defining module would not be seen.
+
+    A no-op for vLLM's own draft, which has no ``share_with_target``.
+    """
+    try:
+        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+    except ImportError:
+        return
+
+    original = DSparkSpeculator.load_draft_model
+    if getattr(original, "_atom_dspark_share_patched", False):
+        return
+
+    @functools.wraps(original)
+    def load_draft_model(self, target_model, *args, **kwargs):
+        draft = original(self, target_model, *args, **kwargs)
+        _share_atom_draft_with_target(draft, target_model)
+        return draft
+
+    load_draft_model._atom_dspark_share_patched = True
+    DSparkSpeculator.load_draft_model = load_draft_model
+
+
 def _patch_vllm_llm_base_model_sharing() -> None:
     """Run ATOM draft sharing after vLLM's generic MTP sharing path, and widen
     the proposer's ``allowed_attn_types`` with ``CommonAttentionMetadata`` for
@@ -837,6 +873,7 @@ def apply_vllm_spec_decode_patch() -> None:
     _patch_dspark_markov_embed_bounds()
     _patch_vllm_dspark_dcp_inputs()
     _patch_vllm_llm_base_model_sharing()
+    _patch_dspark_draft_sharing()
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()
     _patch_vllm_deepseek_v4_mtp_first_pass_inputs()
