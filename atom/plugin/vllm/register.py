@@ -40,6 +40,13 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     ),
     # vLLM registers this arch too, but only to its NVIDIA implementation.
     "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkVllm",
+    # vLLM ships an AMD DSpark drafter for V4, so this override is not about
+    # coverage -- it is about acceptance. vLLM's loses ~1.4x of conc-128
+    # throughput as the decode batch grows where ATOM's holds; see
+    # `models/deepseek_v4_dspark.py` for the measurements and what was ruled out.
+    "DSparkDraftModel": (
+        "atom.plugin.vllm.models.deepseek_v4_dspark:DeepseekV4DSparkVllm"
+    ),
     "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
