@@ -241,8 +241,12 @@ class DeepseekV4DSparkVllm(ATOMMoEForCausalLM):
             return
 
         from atom.plugin.vllm.deepseek_v4_bridge import (
-            atom_deepseek_v4_forward_context,
             bind_deepseek_v4_proxy_cache_views,
+            get_deepseek_v4_target_metadata,
+        )
+        from atom.utils.forward_context import (
+            reset_forward_context,
+            set_forward_context,
         )
 
         proxy_layer_name = self.__dict__.get("_deepseek_v4_proxy_layer_name")
@@ -253,17 +257,38 @@ class DeepseekV4DSparkVllm(ATOMMoEForCausalLM):
             # Proxy cache not bound yet: this is a dummy/profile pass whatever
             # vLLM said, and there is nothing real to write into.
             return
-        with atom_deepseek_v4_forward_context(
+
+        # The TARGET's metadata and context, not the draft's. `hidden_states`
+        # here is the target's ragged batch of every scheduled token, so
+        # `write_context_kv` needs that batch's `cu_seqlens_q` spans and its
+        # `scheduled_bs`; the draft's own metadata describes its [num_reqs x T]
+        # block instead and would slice the wrong rows. `state_slot_out` is the
+        # per-request ring slot, and the draft wants exactly the target's
+        # mapping -- it has its own KV plane, not its own slot numbering.
+        #
+        # Taken from the stash rather than vLLM's forward context: the
+        # speculator runs after the target's context has exited, so it is not
+        # readable there.
+        remembered = get_deepseek_v4_target_metadata()
+        if remembered is None:
+            raise RuntimeError(
+                "DSpark draft cannot write its context KV: no target V4 "
+                "metadata was recorded for this step. `write_context_kv` needs "
+                "the target batch's cu_seqlens_q spans and per-request state "
+                "slots."
+            )
+        target_md, target_context = remembered
+        set_forward_context(
+            attn_metadata=target_md,
             atom_config=self.atom_config,
-            input_ids=None,
-            positions=positions,
-            force_dummy=False,
-            state_model=self.model,
-            meta_params=getattr(self.model, "_atom_v4_meta_params", None),
-            slot_allocator=getattr(self.model, "_atom_v4_slot_allocator", None),
-            proxy_layer_name=proxy_layer_name,
-        ):
+            context=target_context,
+            num_tokens=int(positions.numel()),
+            in_hipgraph=False,
+        )
+        try:
             self.model.write_combined_context_kv(hidden_states, positions)
+        finally:
+            reset_forward_context()
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_draft_logits(hidden_states)
