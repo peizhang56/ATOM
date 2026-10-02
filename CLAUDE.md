@@ -25,28 +25,37 @@ Two branches hold this work. Keep both current:
 | `ds_v4_atom_vllm_dspark_draft_t7fix` | the **code**: ATOM-owned DSpark draft + the block-width fix |
 | `ds_v4_dspark_worklog` | the **worklog**: this file, `SESSION-HANDOFF.md`, serve/stop scripts, `accept_probe.py`, server logs. An orphan branch — no ATOM code history. |
 
-Restore onto a fresh node with:
+Both branches live in the **same** fork repo, so one clone restores everything.
+The worklog branch has unrelated history (its own `git init`); that is fine for
+a worktree.
 
 ```bash
 git clone git@github.com:peizhang56/ATOM.git /app/ATOM && cd /app/ATOM
-git remote add upstream git@github.com:peizhang56/ATOM.git   # if cloned from ROCm
-git checkout ds_v4_atom_vllm_dspark_draft_t7fix
-pip install -e .
+git remote add upstream git@github.com:peizhang56/ATOM.git   # same URL as origin here
+git remote set-url --push origin DISABLED                    # don't push to a fork by accident
+git checkout ds_v4_atom_vllm_dspark_draft_t7fix && pip install -e .
 git worktree add /home/pzhang12/deepseek2 ds_v4_dspark_worklog
 ```
 
+(On *this* node `origin` is `ROCm/ATOM.git` and `upstream` is the fork, which
+is backwards from the usual convention — check `git remote -v` before pushing
+anywhere, every time.)
+
 **Push at the end of every working session, and before any reboot or
 long-running job.** A finding that exists only in this node's filesystem is a
-finding you are about to lose. The worklog branch is cheap — logs included, it
-is under 2 MB.
+finding you are about to lose. The worklog branch is cheap — logs included, the
+whole thing is ~210 KB.
 
 ```bash
 # code
 cd /app/ATOM && git push upstream HEAD
-# worklog
+# worklog  (remote name is `upstream` on this node, `origin` on a fresh clone)
 cd /home/pzhang12/deepseek2 && git add -A && git commit -m "worklog: <what>" \
   && git push upstream HEAD:ds_v4_dspark_worklog
 ```
+
+Keep the two in step: the worklog cites commit SHAs from the code branch, so
+push the code first.
 
 ---
 
