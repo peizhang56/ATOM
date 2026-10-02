@@ -93,11 +93,77 @@ Candidates, untested:
   the model sits on near-ties often enough for this to flip tokens.
 - Anchor / bonus-token handling at a block boundary.
 
-**Open question that decides ownership:** does the *shipped* arm
-(`ds_v4_atom_vllm`, vLLM's own draft) show the same deficit? If yes this is a
-property of DSpark-on-V4 in plugin mode and not of the ATOM draft; if no, the
-ATOM draft introduced it. Not yet run.
+### 3.3 Ownership of the deficit: pre-existing, and WORSE in the shipped arm
 
-## 4. Stages 4–5 — not started
+Ran the same three-repeat full GSM8K on `upstream/ds_v4_atom_vllm` (vLLM's own
+draft), strict-match:
 
-Stage 4 (ISL 115k sweep, three arms) and Stage 5 (recipe + CI) are untouched.
+| arm | runs | mean |
+|---|---:|---:|
+| spec-OFF | 0.9530, 0.9462, 0.9530 | **0.9507** |
+| spec-ON, **ATOM** draft (ours) | 0.9409, 0.9447, 0.9416, 0.9378 | **0.9413** |
+| spec-ON, **vLLM** draft (shipped) | 0.9386, 0.9060, 0.9340 | **0.9262** |
+
+So the accuracy deficit under speculation is **pre-existing and larger in the
+shipped arm**. The ATOM draft did not introduce it and in fact roughly halves
+it. Root-causing it is a DSpark-on-V4 plugin issue, not a blocker on this work.
+
+---
+
+## 4. THE HEADLINE: the ATOM draft drafts far worse than vLLM's
+
+Same workload (GSM8K, 5-shot, `num_concurrent=64`), same server config, same
+node — only the draft model differs:
+
+| | pos 1 | pos 2 | pos 3 | pos 4 | mean accept len | accepted tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| **vLLM draft** (shipped) | 0.898 | 0.782 | 0.593 | 0.429 | **4.28 – 4.37** | ~1300 |
+| **ATOM draft** (ours, `_t7fix`) | 0.654 | 0.411 | 0.194 | 0.099 | **2.44** | ~646 |
+
+**The gap is already at position 1** — 0.65 vs 0.90. No block-width,
+RoPE-extrapolation or "trained at γ=5, run at 7" argument explains a
+first-token gap: position 1 is the easiest prediction and the one least
+sensitive to block geometry. Something in the ATOM draft's wiring is feeding it
+a degraded context.
+
+It is **not** cudagraph-related: fully eager the ATOM draft reaches only
+1.98–2.50, essentially the same as captured (2.07–2.44). So Stage 1's fixes are
+real but orthogonal to this.
+
+### What this means for the project
+
+The premise of the whole effort — from `SESSION-HANDOFF.md` §3, that vLLM's
+drafter loses acceptance with batch (3.31 @ conc 16 -> 2.38 @ 128) while ATOM's
+holds ~3.3, so ATOM's should replace it — **is not supported in this regime**.
+Here vLLM's draft is the better drafter by a wide margin, on both acceptance
+(1.8x) and accuracy.
+
+Shipping the ATOM draft today would be a regression on both axes. It is not
+ready, and Stage 5 should not run.
+
+Two readings, and they need separating before any more work:
+
+1. **Our wiring is still defective.** Most likely. Native ATOM reportedly gets
+   ~3.3 at ISL 115k, so 2.44 at short context with a 0.65 first position
+   suggests the draft is attending to a wrong or stale rolling context window
+   (`precompute_and_store_context_kv` -> `write_combined_context_kv`), or its
+   weights are mapped subtly wrong (`f32df74be` fixed 97/97 weights being at
+   init values -- worth re-verifying they are mapped correctly, not just
+   loaded).
+2. ATOM's draft is genuinely weaker at short context, and its advantage only
+   appears at 115k. Possible, but it does not explain position 1.
+
+### Next step, concrete
+
+Measure the ATOM draft's first-position acceptance against **native ATOM** on
+the same prompts. Native is the reference implementation of this exact draft:
+if native also gives ~0.65 at position 1, reading (2) holds and the premise
+needs re-examining; if native gives ~0.9, the defect is in the plugin wiring
+and is findable by diffing what native feeds `write_context_kv` against what
+the plugin feeds it.
+
+## 5. Stages 4–5 — not started, and Stage 5 should not start
+
+Stage 4's ISL-115k sweep is now differently motivated: it is no longer "confirm
+ATOM's drafter holds up" but "find out whether it is ever better". Stage 5
+(recipe + CI) must wait until §4 is resolved.

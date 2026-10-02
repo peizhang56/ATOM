@@ -462,6 +462,23 @@ traceback that reads like a dtype bug and is not. Pair with
 
 ## 6. The plan
 
+> **STATUS 2026-10-02: Stages 1–3 done. `RESULTS.md` has every number.**
+> Stage 1 (cudagraph fault) is **fixed** — the arm serves 256/256 at
+> concurrency 128, zero faults, 1105–1190 tok/s. Stage 2 was a **non-problem**
+> (one KV group, patch dormant). Stage 3 found the thing that matters:
+>
+> **The ATOM-owned draft drafts far worse than the vLLM draft it was meant to
+> replace** — mean accepted length 2.44 vs 4.33, and the gap is already at
+> position 1 (0.65 vs 0.90). Not cudagraph-related (eager is the same).
+> The founding premise is not supported in this regime, and Stage 5 must not
+> run. See `RESULTS.md` §4 for the decisive next experiment (compare position-1
+> acceptance against **native** ATOM, which is this draft's reference
+> implementation).
+>
+> Good news from the same work: the accuracy deficit under speculation is
+> **pre-existing and larger in the shipped arm** (vLLM draft 0.9262 vs ATOM
+> draft 0.9413 vs spec-off 0.9507), so this work did not introduce it.
+
 ### What changed about the framing
 
 The task was set up as "re-implement from scratch on clean `main`". After
