@@ -61,6 +61,7 @@ itself, mirroring ``model_wrapper.ATOMModelBase.forward``.
 """
 
 import logging
+from types import SimpleNamespace
 
 import torch
 
@@ -258,6 +259,71 @@ class DeepseekV4DSparkVllm(ATOMMoEForCausalLM):
         # already target ids and need no remap table.
         self.draft_id_to_target_id = None
         self.model.vllm_block_width = vllm_block_width(vllm_config)
+        # Persistent request-id ramp for `prepare_draft_block`. Native reads
+        # this off its own metadata builder (`metadata_builder.row_ids`); the
+        # plugin has no ATOM builder for the draft, and `mask_pad_tail` only
+        # ever wants `arange(real_batch)` broadcast across each row's T tokens.
+        self._row_ids: torch.Tensor | None = None
+        self._logged_pad = False
+
+    def prepare_draft_block(self, scheduled_bs: int, running_bs: int) -> None:
+        """Sentinel the padded tail of the draft block, OUTSIDE the graph.
+
+        vLLM pads the draft batch up to a cudagraph bucket and hands the model
+        the padded token count, so ATOM's block runs ``running_bs`` blocks while
+        only the first ``scheduled_bs`` are real. The fabricated rows inherit
+        ring slot 0 -- a *live* request's slot -- so left alone they scatter
+        their draft KV into request 0's window.
+
+        ATOM already owns the fix: ``prepare_block`` -> ``mask_pad_tail`` marks
+        those rows ``batch_id == -1``, which the fused SWA scatter gates on.
+        Native calls it from ``DSparkProposer.propose`` for exactly this reason,
+        and says why it cannot live inside the block::
+
+            Here and not inside the block: `run` may REPLAY, and then nothing
+            in the block's Python runs at all.
+
+        That applies verbatim here, and harder: vLLM dispatches the draft with
+        ``query_cudagraph_manager.run_fullgraph(batch_desc)``, which replays the
+        graph and runs none of ``_generate_draft``'s Python. So this must be
+        driven from a step-wise hook outside the replay -- ATOM patches
+        ``_build_draft_attn_metadata``, which vLLM rebuilds every step precisely
+        so builder-side state stays current (see ``spec_decode_patch``).
+
+        A no-op during capture, which never reaches this hook: capture's dummy
+        batch is entirely real, and ``batch_ids`` is allocated as the matching
+        ramp, so the captured kernels see the right map either way.
+        """
+        T = self.model.vllm_block_width
+        if T is None or running_bs <= 0:
+            return
+        inner = self.model.model
+        device = next(inner.parameters()).device
+        # Size the ramp off the index bundle itself rather than off a separate
+        # max_num_seqs reading: the bundle is what `mask_pad_tail` indexes, so
+        # taking its own `max_batch` cannot disagree with it. `index_buffers` is
+        # lazy but cached, and `prepare_block` resolves the same bundle.
+        bufs = inner.index_buffers(T, int(self.model.window_size), device)
+        if self._row_ids is None or self._row_ids.numel() < bufs.max_batch:
+            self._row_ids = torch.arange(
+                bufs.max_batch, dtype=torch.int32, device=device
+            )
+        # `prepare_block` is the public hook; it reads only `.row_ids`.
+        self.model.prepare_block(
+            SimpleNamespace(row_ids=self._row_ids),
+            T,
+            int(scheduled_bs),
+            int(running_bs),
+        )
+        if running_bs != scheduled_bs and not self._logged_pad:
+            self._logged_pad = True
+            logger.info(
+                "ATOM plugin: DSpark draft block is cudagraph-padded "
+                "(%d real of %d blocks, T=%d); sentinelling the tail each step.",
+                scheduled_bs,
+                running_bs,
+                T,
+            )
 
     def combine_hidden_states(self, aux_concat: torch.Tensor) -> torch.Tensor:
         return self.model.project_context(aux_concat)
