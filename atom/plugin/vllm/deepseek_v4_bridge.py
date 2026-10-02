@@ -1261,6 +1261,29 @@ def _infer_atom_attn_state(common_attn_metadata, num_spec_tokens: int = 0):
     decode_q = 1 + max(0, int(num_spec_tokens))
     if _is_pure_uniform_decode(common_attn_metadata, decode_q):
         return AttnState.DECODE
+    # The DSpark DRAFT's block pass is a uniform fixed-width batch too, just at
+    # a NARROWER width than the target's verify: vLLM lays it out at
+    # ``num_query_per_req`` (== num_speculative_tokens, 7) while ``decode_q`` is
+    # ``1 + num_speculative_tokens`` (8). The width test above therefore misses
+    # it, and it fell through to PREFILL -- which is precisely the bug this
+    # function's docstring describes, only on the draft's own metadata build:
+    # PREFILL allocates fresh per-step tensors at new addresses, and the draft
+    # HAS a captured FULL graph of its own (``DFlashCudaGraphManager``), so the
+    # replay reads capture-time addresses that have since been freed. That
+    # faults the GPU under cudagraphs and is invisible eagerly.
+    #
+    # Scoped to widths STRICTLY BELOW ``decode_q`` so the target's
+    # classification cannot change: a chunked prefill is far wider, and a ragged
+    # batch fails the uniformity test inside ``_is_pure_uniform_decode``, which
+    # also still applies the ``is_prefilling`` guard.
+    num_reqs_u = int(getattr(common_attn_metadata, "num_reqs", 0) or 0)
+    num_tokens_u = int(getattr(common_attn_metadata, "num_actual_tokens", 0) or 0)
+    if num_reqs_u > 0:
+        uniform_q = num_tokens_u // num_reqs_u
+        if 0 < uniform_q < decode_q and _is_pure_uniform_decode(
+            common_attn_metadata, uniform_q
+        ):
+            return AttnState.DECODE
     num_computed = getattr(common_attn_metadata, "_num_computed_tokens_cpu", None)
     if num_computed is not None and bool((num_computed > 0).any().item()):
         return AttnState.PREFILL_PREFIX
