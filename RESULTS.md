@@ -429,7 +429,56 @@ That is a much tighter target than "something in the integration". Everything
 between the aux tap and the ring is live and roughly right; what is in those
 rows is not as good as what native puts there.
 
+### 6.8 The `main_x` discriminator was run. It is noise-limited and cannot settle it.
+
+Instrumented (`1993cb89b`, flag-gated) at `DeepseekV4DSpark.project_context` —
+the one method BOTH arms reach, native via `write_context_kv`, the plugin via
+`combine_hidden_states`. One fixed 19-token prompt, greedy, single request, a
+pinned-row filter so only that prefill is captured. Both arms returned the
+**identical completion**.
+
+First read looked decisive — `aux_concat` differing 32% relative between arms.
+Then the control this project's rules require ("A differs from A" before "A
+differs from B", `CLAUDE.md` §5) was run: native restarted and given the same
+prompt again.
+
+| pair | aux cos | aux rel | **main_x cos** | **main_x rel** |
+|---|---:|---:|---:|---:|
+| **native vs native** (control) | 0.9929 | 7.9% | **0.9893** | **13.97%** |
+| plugin vs native | 0.9889 | 32.0% | 0.9862 | 15.13% |
+| plugin vs native2 | 0.9872 | 32.9% | 0.9842 | 16.48% |
+
+**`main_x` — the tensor that actually feeds the draft's rolling window — differs
+between arms by 15.1%, against a same-arm run-to-run floor of 14.0%.** That is
+not a difference. The method cannot see a signal here.
+
+So the §4 "cheapest discriminator" is answered: **it does not discriminate.**
+Recorded so the next session does not spend another two server boots on it.
+
+Two real things do fall out:
+
+- `aux_concat` genuinely differs more between arms (32%) than within one arm
+  (7.9%), with min row cosine 0.902 vs 0.976 — about 4× the floor. The layer
+  correspondence is **correct** (diagonal cosines 0.987/0.988/0.990 dominate
+  every off-diagonal, so no permutation, no off-by-one layer, no scale factor).
+  But whatever that difference is, it does not survive `main_proj` into `main_x`
+  at a level this method can resolve.
+- **The arm's determinism floor is itself remarkable and under-appreciated.**
+  Two native runs of the same prompt, same seed, greedy, produce hidden states
+  14% apart on `main_x` while emitting identical text. For an MoE target that is
+  explainable — a tiny numerical difference flips a top-k expert and the
+  residual moves a lot — but it means *no* hidden-state A/B on a live server can
+  resolve anything finer than ~15%. §3.1 reported this arm as non-deterministic
+  in its outputs; this quantifies it in its activations.
+
 ### Next step
+
+Hidden-state comparison on a live server is a dead end at this precision. To
+compare the two code paths numerically, the nondeterminism has to be removed
+rather than averaged over: load the target once **offline**, outside any server,
+run one fixed prefill through both the native and plugin aux paths in the same
+process, and diff. Same weights, same input, no scheduler, no MoE routing
+divergence between processes — then a 15% difference means something.
 
 Candidates (2) aux hidden states and (3) weight mapping from §4 are still open,
 minus the `res_preshuffle` sub-case. The discriminator named in §4 has not been
