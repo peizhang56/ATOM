@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Hashable
 from contextlib import contextmanager
 from functools import cache
@@ -41,6 +42,58 @@ _V4_SWA_DEST_RATIOS = (0, 4, 128)
 def _warn_once(msg: str, *args: Hashable) -> None:
     """Log once per distinct message+args; callers fire from per-step paths."""
     logger.warning(msg, *args)
+
+
+# The FP4 indexer's decode schedule is not built on this path yet; see
+# `_v4_index_fp4`. One place to flip when it is.
+_V4_INDEX_FP4_SUPPORTED = False
+
+
+def _v4_index_fp4(vllm_config) -> bool:
+    """Whether the V4 sparse indexer scores in FP4 on this path.
+
+    The single authority for the fp4 decision, mirroring :func:`_v4_kv_fp8`:
+    proxy sizing, the view carve and the per-module bind all key off it, so the
+    pool geometry and the runtime dispatch cannot disagree.
+
+    Native takes FP4 for V4 on anything but gfx942 (`config.py`), and gets 64
+    index rows per block because it forces `kv_cache_block_size = 256` for every
+    DeepseekV4 arch. The proxy now uses that same 256, which is what makes FP4
+    reachable here at all -- `fp4_index_block_shapes` requires exactly
+    `FP4_KV_BLOCK_SIZE` (64) rows and the old block-128 proxy gave 32.
+
+    `sparse_indexer_fp4_enabled` owns the structural half of the test (head dim,
+    head count, pooling, chip), so this only adds the decision ATOM's own config
+    resolution would have made.
+    """
+    from atom.model_ops.sparse_indexer_fp4 import (
+        FP4_KV_BLOCK_SIZE,
+        sparse_indexer_fp4_enabled,
+    )
+
+    # NOT YET REACHABLE, and deliberately so. The proxy carve below budgets and
+    # binds both FP4 planes correctly, but `_score_topk_decode_fp4_flydsl` also
+    # reads a per-step schedule -- `fp4_local_starts` / `fp4_local_ends` /
+    # `fp4_cta_info` / `fp4_n_ctas` -- that native builds in
+    # `deepseek_v4_attn.py` via `compute_prefill_schedule` and this bridge does
+    # not build at all. A missing schedule does not fault; it scores against
+    # garbage CTA assignments, so the failure would be silently wrong top-k.
+    #
+    # Returning False here keeps the carve on FP8 and, because this is the
+    # single authority the sizing, carve and bind all read, keeps those three
+    # in agreement. Flip `_V4_INDEX_FP4_SUPPORTED` once the schedule is ported
+    # -- the inputs it needs (`batch_id_per_q_token`,
+    # `csa_n_committed_per_token`) are already built on this path.
+    #
+    # Worth 1.176x of decode step time at ISL 115k, measured by running NATIVE
+    # with `--index_cache_dtype fp8`; see kb/p4-the-decode-gap-decomposes.
+    if not _V4_INDEX_FP4_SUPPORTED:
+        return False
+
+    if ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4 != FP4_KV_BLOCK_SIZE:
+        return False
+    hf = vllm_config.model_config.hf_config
+    return sparse_indexer_fp4_enabled("fp4", hf)
 
 
 def _v4_kv_fp8(vllm_config) -> bool:
@@ -189,25 +242,51 @@ def _proxy_region_byte_sizes(
     rope_head_dim: int,
     index_head_dim: int,
     kv_fp8: bool,
+    index_fp4: bool = False,
 ) -> list[int]:
-    """Linear proxy layout: [NoPE plane][RoPE plane?][CSA indexers].
+    """Linear proxy layout: [NoPE plane][RoPE plane?][CSA indexers(+scales)].
 
     Matches native ``allocate_per_req_cache``: both KV planes are adjacent and
     ``plan_regions``-aligned; indexer bytes follow. Inserting indexers between
     the planes breaks ``EntryMajorArena``'s 256 B retype boundary on the RoPE
     plane.
+
+    Under ``index_fp4`` the indexer is TWO regions, not one -- the packed E2M1
+    keys and their e8m0 exponents -- exactly as native's pool declares them
+    (``mla_kv_pool.MLAKVPool``: ``EntryField("index", ...)`` plus
+    ``EntryField("index_scale", ...)``). A mover that takes one without the
+    other restores keys without their exponents.
     """
     nope_row_bytes = head_dim * (1 if kv_fp8 else 2)
     regions = [geometry.plane_bytes(nope_row_bytes)]
     if kv_fp8:
         regions.append(geometry.plane_bytes(rope_head_dim * 2))
-    regions.append(
-        csa_layers
-        * num_blocks
-        * (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4)
-        * _index_row_bytes(index_head_dim)
-    )
+    rows_per_block = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
+    if index_fp4:
+        data_bytes, scale_bytes = _fp4_index_block_bytes(rows_per_block, index_head_dim)
+        regions.append(csa_layers * num_blocks * data_bytes)
+        regions.append(csa_layers * num_blocks * scale_bytes)
+    else:
+        regions.append(
+            csa_layers * num_blocks * rows_per_block * _index_row_bytes(index_head_dim)
+        )
     return regions
+
+
+def _fp4_index_block_shapes(rows_per_block: int, index_head_dim: int):
+    """One block's (packed E2M1, e8m0) shapes for one indexer layer.
+
+    Delegates to the single place that owns the FP4 indexer ABI so the proxy
+    carve cannot drift from the kernels that read it.
+    """
+    from atom.model_ops.sparse_indexer_fp4 import fp4_index_block_shapes
+
+    return fp4_index_block_shapes(rows_per_block, index_head_dim)
+
+
+def _fp4_index_block_bytes(rows_per_block: int, index_head_dim: int) -> tuple[int, int]:
+    data_shape, scale_shape = _fp4_index_block_shapes(rows_per_block, index_head_dim)
+    return (math.prod(data_shape), math.prod(scale_shape))
 
 
 def _v4_proxy_min_blocks(vllm_config) -> int:
@@ -234,6 +313,7 @@ def _proxy_page_bytes(vllm_config) -> int:
     rope_head_dim = _v4_rope_head_dim(hf)
     index_head_dim = int(getattr(hf, "index_head_dim", 128))
     kv_fp8 = _v4_kv_fp8(vllm_config)
+    index_fp4 = _v4_index_fp4(vllm_config)
     _arena_planes, arena_rows, _row_widths = _v4_state_layout(vllm_config, kv_fp8)
     win = _v4_win_with_spec(vllm_config, int(getattr(hf, "sliding_window", 128)))
     max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
@@ -256,6 +336,7 @@ def _proxy_page_bytes(vllm_config) -> int:
         rope_head_dim=rope_head_dim,
         index_head_dim=index_head_dim,
         kv_fp8=kv_fp8,
+        index_fp4=index_fp4,
     )
     _, total = plan_regions(regions)
     # vLLM 0.26 may pack this cache after another layer at a non-aligned
@@ -281,6 +362,7 @@ def slice_deepseek_v4_proxy_cache_views(
     head_dim: int = 512,
     index_head_dim: int = 128,
     kv_fp8: bool = False,
+    index_fp4: bool = False,
     rope_head_dim: int = 64,
     arena_planes=None,
     arena_rows: int = 0,
@@ -323,6 +405,7 @@ def slice_deepseek_v4_proxy_cache_views(
         arena_rows=arena_rows,
     )
     csa_indexer: list[torch.Tensor] = []
+    csa_indexer_scale: list[torch.Tensor] = []
     csa_rows = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
     n_csa = sum(1 for r in ratios if r == 4)
 
@@ -346,6 +429,7 @@ def slice_deepseek_v4_proxy_cache_views(
         rope_head_dim=rope_head_dim,
         index_head_dim=index_head_dim,
         kv_fp8=kv_fp8,
+        index_fp4=index_fp4,
     )
     region_offsets, layout_total = plan_regions(regions)
 
@@ -365,7 +449,26 @@ def slice_deepseek_v4_proxy_cache_views(
             .view(geometry.plane_rows, rope_head_dim)
         )
         region_idx += 1
-    if n_csa:
+    if n_csa and index_fp4:
+        # Two planes, as native declares them: packed E2M1 keys and their e8m0
+        # exponents. Shapes come from `fp4_index_block_shapes`, the one owner of
+        # this ABI, so the carve cannot drift from the kernels that read it.
+        data_shape, scale_shape = _fp4_index_block_shapes(csa_rows, index_head_dim)
+        per_layer_data = num_blocks * math.prod(data_shape)
+        per_layer_scale = num_blocks * math.prod(scale_shape)
+        data_blob = take_region(region_idx)
+        region_idx += 1
+        scale_blob = take_region(region_idx)
+        for layer_idx in range(n_csa):
+            d = data_blob[
+                layer_idx * per_layer_data : (layer_idx + 1) * per_layer_data
+            ]
+            s = scale_blob[
+                layer_idx * per_layer_scale : (layer_idx + 1) * per_layer_scale
+            ]
+            csa_indexer.append(d.view(num_blocks, *data_shape))
+            csa_indexer_scale.append(s.view(num_blocks, *scale_shape))
+    elif n_csa:
         per_layer_indexer = num_blocks * csa_rows * index_dim
         indexer_blob = take_region(region_idx)
         for layer_idx in range(n_csa):
@@ -437,6 +540,8 @@ def slice_deepseek_v4_proxy_cache_views(
         "unified": unified,
         "csa_main": csa_main,
         "csa_indexer": csa_indexer,
+        # Empty unless `index_fp4`; the e8m0 exponents paired with csa_indexer.
+        "csa_indexer_scale": csa_indexer_scale,
         "hca_main": hca_main,
         "unified_rope": unified_rope,
         "csa_main_rope": csa_main_rope,
@@ -1036,6 +1141,7 @@ def bind_deepseek_v4_proxy_cache_views(
     # meta_params so the metadata builder stages the fp8 op5 per-token decode
     # index tensors (qo_indptr / kv_last_page_lens) only under fp8.
     kv_fp8 = _v4_kv_fp8(vllm_config)
+    index_fp4 = _v4_index_fp4(vllm_config)
     arena_planes, arena_rows, row_widths = _v4_state_layout(vllm_config, kv_fp8)
     rope_head_dim = _v4_rope_head_dim(vllm_config.model_config.hf_config)
     # CSA/HCA Main scatter mode: fp8 2buff -> "main_2buff_fp8" (nope fp8 + parallel
@@ -1058,6 +1164,7 @@ def bind_deepseek_v4_proxy_cache_views(
         head_dim=int(model.args.head_dim),
         index_head_dim=int(model.args.index_head_dim),
         kv_fp8=kv_fp8,
+        index_fp4=index_fp4,
         rope_head_dim=rope_head_dim,
         arena_planes=arena_planes,
         arena_rows=arena_rows,
@@ -1111,6 +1218,11 @@ def bind_deepseek_v4_proxy_cache_views(
                 kv_cache_rope=views["csa_main_rope"][csa_i],
             )
             attn.indexer.kv_cache = views["csa_indexer"][csa_i]
+            if index_fp4:
+                # The FP4 scorer reads the e8m0 exponents off `kv_scale`
+                # (`_score_topk_decode_fp4_flydsl`). Binding the keys without
+                # them would score packed E2M1 as if it were already scaled.
+                attn.indexer.kv_scale = views["csa_indexer_scale"][csa_i]
             attn.indexer._max_model_len_idx = max(
                 1, int(vllm_config.model_config.max_model_len) // 4
             )
