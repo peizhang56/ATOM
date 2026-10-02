@@ -867,9 +867,86 @@ def _patch_vllm_dspark_dcp_inputs() -> None:
     apply_vllm_dspark_dcp_input_patch()
 
 
+def _patch_dspark_draft_block_padding() -> None:
+    """Give the ATOM DSpark draft a step-wise hook outside the graph replay.
+
+    vLLM pads the draft batch to a cudagraph bucket
+    (``dispatch_cg_and_sync_dp``) and hands the model the PADDED token count, so
+    ATOM's request-parallel block runs ``num_reqs_padded`` blocks while only
+    ``num_reqs`` are real. vLLM's own drafts do not care -- they are
+    token-parallel, every row independent -- but ATOM's rebuilds each block from
+    an anchor and indexes per-request ring slots, and the fabricated rows
+    inherit slot 0, a live request's. Left alone they scatter draft KV into it.
+
+    The hook has to run every step and OUTSIDE the graph, because the FULL path
+    is ``query_cudagraph_manager.run_fullgraph(batch_desc)`` -- a pure replay
+    that runs none of ``_generate_draft``'s Python.
+    ``_build_draft_attn_metadata`` is the one call that satisfies both: vLLM
+    rebuilds it on every step by design ("even when replaying the FULL graph so
+    that any attention metadata builder state is updated"), it is outside the
+    replay, and it is handed both counts.
+
+    Scoped by ``prepare_draft_block`` being present, so this is a no-op for
+    vLLM's own DSpark draft and for every other speculator.
+    """
+    try:
+        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+    except ImportError:
+        return
+
+    original = DSparkSpeculator._build_draft_attn_metadata
+    if getattr(original, "_atom_dspark_block_padding_patched", False):
+        return
+
+    @functools.wraps(original)
+    def wrapped_build_draft_attn_metadata(
+        self, num_reqs, num_reqs_padded, num_tokens_padded, *args, **kwargs
+    ):
+        prepare = getattr(getattr(self, "model", None), "prepare_draft_block", None)
+        if prepare is None:
+            return original(
+                self, num_reqs, num_reqs_padded, num_tokens_padded, *args, **kwargs
+            )
+
+        # The padding that reaches the model is the TOKEN count, not the request
+        # count: upstream spells them
+        #
+        #     num_reqs_padded   = batch_desc.num_reqs or num_reqs   # often None
+        #     num_tokens_padded = batch_desc.num_tokens             # the padded one
+        #
+        # and then runs the draft over `num_tokens_padded`. A token-parallel
+        # draft does not notice. ATOM's block is request-parallel, so it runs
+        # `num_tokens_padded // T` BLOCKS -- which can exceed `num_reqs` even
+        # when `num_reqs_padded == num_reqs`.
+        block_bs = num_tokens_padded // max(1, int(self.num_query_per_req))
+
+        # Publish the per-request tables at the width the block actually runs.
+        # Native states the failure this prevents exactly: "a Python slice past
+        # the end truncates rather than raising, so the kernels got a slot table
+        # shorter than their own grid and read past it"
+        # (`dspark_proposer.py`). The widened rows are inert -- the V4 bridge
+        # fills their ring slot with 0 and their seq_len with 0.
+        num_reqs_padded = max(num_reqs_padded, block_bs)
+
+        md = original(
+            self, num_reqs, num_reqs_padded, num_tokens_padded, *args, **kwargs
+        )
+        # ...and then keep those inert rows from scattering into slot 0.
+        prepare(num_reqs, block_bs)
+        return md
+
+    wrapped_build_draft_attn_metadata._atom_dspark_block_padding_patched = True
+    DSparkSpeculator._build_draft_attn_metadata = wrapped_build_draft_attn_metadata
+    logger.info(
+        "ATOM plugin: sentinelling the DSpark draft's cudagraph-padded block "
+        "tail outside the graph replay."
+    )
+
+
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
     _patch_dspark_fused_markov_sample()
+    _patch_dspark_draft_block_padding()
     _patch_dspark_markov_embed_bounds()
     _patch_vllm_dspark_dcp_inputs()
     _patch_vllm_llm_base_model_sharing()
