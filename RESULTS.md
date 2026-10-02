@@ -269,3 +269,56 @@ Prior-session 115k sweeps live in `/home/pzhang12/deepseek/results_mi355x_*`.
 Note `client_dsv4_pro_0813.sh` writes ~420 KB/request of prompt text twice per
 point; commit only `report.*`, `arm.json`, `economics.*` and the per-point
 `profile_c*.json`, never `inputs.json`/`prompts.jsonl`.
+
+---
+
+## 9. The 4.45-vs-2.14 gap is THREE effects, not one (2026-10-02)
+
+I had been benchmarking the plugin's draft against native's 4.45. That is the
+wrong reference: native runs three flags the plugin does not
+(`serve_dsv4_pro_atom_native_tp8.sh:28,30`):
+
+```
+-tp 8 --kv_cache_dtype fp8 --index_cache_dtype fp4
+--enable-dp-attention --enable-tbo
+```
+
+Measured by running **native with the plugin's configuration**, probe regime,
+`accept_probe.py --concurrency 32`:
+
+| native config | indexer | DP+TBO | acc.len |
+|---|---|---|---:|
+| full (as shipped) | fp4 | on | **4.45** |
+| `serve_native_fp8idx.sh` | **fp8** | on | **3.76 – 3.90** |
+| `serve_native_plugincfg.sh` | fp8 | **off** | **3.45 – 3.53** |
+| plugin + ATOM draft | fp8 | off | **2.14** |
+
+| cause | cost in accepted tokens |
+|---|---:|
+| fp4 → fp8 indexer | **−0.62** |
+| DP attention + TBO off | **−0.33** |
+| **our integration** | **−1.36** |
+
+### Consequences
+
+- **The config-matched reference for the plugin arm is ~3.50, not 4.45.** Our
+  integration deficit is 1.36 tokens (39%), not 2.3 (52%). Still the largest
+  single term, but 41% of the gap was never our bug.
+- **The FP4 indexer is a correctness item, not only a performance one.**
+  `CLAUDE.md` §4 files it under "Not in scope for correctness" with DP
+  attention. It is worth **+0.62 accepted tokens** on top of its 1.176×
+  throughput, because the indexer selects which tokens sparse attention sees —
+  its precision changes the hidden states the draft consumes. That separation
+  should be revised.
+- **Parity with native needs all four**: the draft fix (+1.36), the fp4 indexer
+  (+0.62), DP attention + TBO (+0.33), plus their throughput effects.
+- This also explains why §5's `aux_concat` differed 32% between arms against a
+  7.9% same-arm floor: the two arms' targets are **not** running the same
+  attention. That difference was real, and it was config, not a wiring defect.
+
+Reproduce: `serve_native_plugincfg.sh`, `serve_native_fp8idx.sh` (both derived
+from the native script by flag substitution), then
+`accept_probe.py --concurrency 32 --requests 160` and
+`grep "MTP Stats " logs/<log>`. With DP on, the batch splits across 8 engines,
+so a small probe never reaches the per-engine stats threshold — use `--requests
+160` or larger.
