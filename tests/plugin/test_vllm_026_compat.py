@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_BLOCK_SIZE
 from atom.plugin.vllm.deepseek_v4_prefix_patch import (
     _kv_cache_config_has_v4_proxy,
     _kv_cache_config_needs_non_immediate_reuse,
@@ -37,19 +38,24 @@ def test_v4_prefix_cache_drop_preserves_vllm_026_boundary():
         )
     )
 
+    # Expressed in BLOCKS, not a pinned token count: the proxy block size
+    # follows native's V4 choice (config.py forces 256 for every DeepseekV4
+    # arch) and a hardcoded 128 here would fail the moment the two are aligned,
+    # for a geometry change rather than a behaviour change.
+    block = ATOM_DEEPSEEK_V4_BLOCK_SIZE
     new_blocks, num_tokens, shared_prefix_boundary = _roll_back_prefix_hit(
         manager,
         computed_blocks,
-        512,  # 4 blocks x 128
+        4 * block,
         384,
-        rollback_tokens=256,
+        rollback_tokens=2 * block,
     )
 
     # No coordinator -> both groups convert with ATOM_DEEPSEEK_V4_BLOCK_SIZE.
     # That fallback is the only reader of the constant, so this also pins the
     # import that used to sit in the installer and raised NameError here.
     assert new_blocks.blocks == ([0, 1], [4, 5])
-    assert num_tokens == 256
+    assert num_tokens == 2 * block
     assert shared_prefix_boundary == 384
 
 
