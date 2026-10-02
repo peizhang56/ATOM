@@ -384,6 +384,51 @@ entirely, defaulting it False — a real asymmetry. It is inert here:
 **False** on this hardware, so both arms reconstruct identically. Would matter
 on gfx1250; does not matter on MI355X.
 
+### 6.7 Three more things measured, all negative — and one good control
+
+Same server, same probe, concurrency 32 unless stated.
+
+| experiment | mean accept | pos 1 | reading |
+|---|---:|---:|---|
+| gate ON (§6.5) | 2.14 | 0.456 | baseline |
+| **concurrency 1** | 2.45 | 0.594 | deficit is NOT batch/slot related |
+| **anchor position −1** | 2.11 | 0.432 | anchor convention is not it |
+| **context write ablated** | **1.05** | **0.034** | the window IS read, and carries most of the quality |
+| native | 4.45 | 0.916 | target |
+
+**Concurrency 1 (2.45).** A single request, no cudagraph padding, no
+`mask_pad_tail`, one state slot, no cross-request interference — and the draft
+still loses most of the gap. So nothing in the batch/padding/slot-indexing
+family explains it. This retires a whole class of suspects, including the ones
+Stage 1 was about.
+
+**Anchor position (2.11).** ATOM and vLLM genuinely spell the anchor
+differently. ATOM takes "the position of the last token already in the
+sequence": `_build_block_plan` does `draft_pos = positions + [1..T]` and spans
+the window over `anchor-(W-1) .. anchor`. Native honours that —
+`Drafter.prepare_inputs` picks anchor row `cu_seqlens_q[req] + accepted_count`,
+position `p0+k`, paired with the token sampled FROM that row, which belongs at
+`p0+k+1`. vLLM's `query_pos = last_valid_pos + 1` already IS the anchor token's
+own position, and its `last_valid_pos` equals native's `p0+k`. So on paper the
+plugin is one too high and `-1` is the correct alignment.
+
+Measured, `-1` is **not better** (2.11 vs 2.14, pos-1 0.432 vs 0.456 — both
+inside noise). Reverted, since shipping a change that measures no better on a
+theory the data does not support is how the last three dead ends started. Worth
+knowing the convention mismatch is real but worth ~nothing: 127 of 128 window
+rows are still correct under a one-position shift.
+
+**Context ablation (1.05) — the useful control.** `ATOM_DSPARK_NO_CTX=1`
+(`e461a8d41`, flag-gated, off by default) skips the context write entirely.
+Acceptance collapses to 1.05 and position-1 to 0.034. So the rolling window is
+genuinely read, genuinely wired, and worth ~1.1 of the 2.14. The draft is not
+running blind; it is running on a context that is *present but inferior* to
+native's.
+
+That is a much tighter target than "something in the integration". Everything
+between the aux tap and the ring is live and roughly right; what is in those
+rows is not as good as what native puts there.
+
 ### Next step
 
 Candidates (2) aux hidden states and (3) weight mapping from §4 are still open,

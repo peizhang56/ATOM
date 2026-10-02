@@ -3018,3 +3018,39 @@ ERROR 10-02 18:18:16 [mxfp4.py:60] Failed to import Triton kernels. Please make 
 (APIServer pid=14382) INFO 10-02 18:20:17 [loggers.py:310] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 146.4 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%
 (APIServer pid=14382) INFO 10-02 18:20:17 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.09, Accepted throughput: 12.00 tokens/s, Drafted throughput: 942.91 tokens/s, Accepted: 120 tokens, Drafted: 9429 tokens, Per-position acceptance rate: 0.076, 0.013, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 1.3%
 (APIServer pid=14382) INFO 10-02 18:20:27 [loggers.py:310] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%
+(APIServer pid=14382) INFO:     127.0.0.1:58318 - "GET /health HTTP/1.1" 200 OK
+(APIServer pid=14382) INFO 10-02 18:29:57 [loggers.py:310] Engine 000: Avg prompt throughput: 6.7 tokens/s, Avg generation throughput: 0.3 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%
+(APIServer pid=14382) INFO 10-02 18:29:57 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.00, Accepted throughput: 0.00 tokens/s, Drafted throughput: 0.02 tokens/s, Accepted: 0 tokens, Drafted: 14 tokens, Per-position acceptance rate: 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 0.0%
+(APIServer pid=14382) INFO:     127.0.0.1:58320 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=14382) INFO:     127.0.0.1:58322 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=14382) INFO:     127.0.0.1:58332 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=14382) INFO:     127.0.0.1:58344 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=14382) INFO 10-02 18:30:07 [loggers.py:310] Engine 000: Avg prompt throughput: 20.1 tokens/s, Avg generation throughput: 50.9 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%
+(APIServer pid=14382) INFO 10-02 18:30:07 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 2.45, Accepted throughput: 30.10 tokens/s, Drafted throughput: 144.90 tokens/s, Accepted: 301 tokens, Drafted: 1449 tokens, Per-position acceptance rate: 0.594, 0.372, 0.217, 0.116, 0.077, 0.053, 0.024, Avg Draft acceptance rate: 20.8%
+(APIServer pid=14382) INFO 10-02 18:30:17 [loggers.py:310] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%
+(EngineCore pid=14951) INFO 10-02 18:32:17 [core.py:1329] [shutdown] EngineCore: trigger received signal=SIGTERM
+(APIServer pid=14382) INFO 10-02 18:32:17 [launcher.py:114] [shutdown] API server: shutdown triggered
+(APIServer pid=14382) INFO 10-02 18:32:17 [launcher.py:130] [shutdown] API server: stopping engine client mode=abort timeout=0s
+(EngineCore pid=14951) INFO 10-02 18:32:17 [core.py:1465] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=14951) INFO 10-02 18:32:17 [core.py:1496] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=14951) INFO 10-02 18:32:17 [core.py:1342] [shutdown] EngineCore: exiting busy loop
+(EngineCore pid=14951) INFO 10-02 18:32:17 [multiproc_executor.py:469] [shutdown] Executor: waiting for worker exit count=8
+(Worker_TP0 pid=15262) INFO 10-02 18:32:17 [multiproc_executor.py:833] Parent process exited, terminating worker queues
+(APIServer pid=14382) INFO 10-02 18:32:17 [core_client.py:689] [shutdown] MPClient: start timeout=0s
+(APIServer pid=14382) INFO 10-02 18:32:17 [core_client.py:691] [shutdown] MPClient: stopping engine manager
+(APIServer pid=14382) INFO 10-02 18:32:17 [utils.py:615] [shutdown] Process manager: send sigterm to process EngineCore
+(APIServer pid=14382) WARNING 10-02 18:32:17 [utils.py:635] [shutdown] Process manager: force killing remaining processes count=1
+(APIServer pid=14382) WARNING 10-02 18:32:17 [utils.py:640] [shutdown] Process manager: force killing remaining process EngineCore pid 14951
+(APIServer pid=14382) INFO 10-02 18:32:17 [core_client.py:693] [shutdown] MPClient: engine manager stopped
+(APIServer pid=14382) INFO 10-02 18:32:17 [core_client.py:694] [shutdown] MPClient: cleaning up background resources
+(APIServer pid=14382) INFO 10-02 18:32:17 [core_client.py:696] [shutdown] MPClient: complete
+(APIServer pid=14382) INFO 10-02 18:32:17 [launcher.py:139] [shutdown] API server: engine client stopped
+(APIServer pid=14382) INFO 10-02 18:32:17 [launcher.py:142] [shutdown] API server: signalling HTTP server shutdown
+(APIServer pid=14382) INFO 10-02 18:32:17 [launcher.py:163] [shutdown] API server: shutting down FastAPI HTTP server
+(APIServer pid=14382) INFO:     Shutting down
+(APIServer pid=14382) INFO:     Waiting for application shutdown.
+(APIServer pid=14382) INFO:     Application shutdown complete.
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 8 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 10 leaked shared_memory objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
