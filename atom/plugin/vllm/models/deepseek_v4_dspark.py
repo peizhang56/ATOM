@@ -26,9 +26,12 @@ histogram came out flat, so the speculator's bookkeeping is not implicated.
 THE CONTRACT LINES UP EXACTLY, which is what makes this a wrapper rather than a
 port:
 
-* vLLM lays the block out as ``[anchor(bonus), MASK x num_speculative_steps]``
-  at width ``num_query_per_req = 1 + num_speculative_steps``; ATOM builds
-  ``[anchor, noise x (T-1)]`` (``deepseek_v4_dspark.py``). Both filler tokens
+* vLLM lays the block out as ``[anchor, MASK x (T-1)]`` at width
+  ``num_query_per_req = num_speculative_steps`` -- the anchor IS the first
+  prediction position, not a separate bonus query (``sample_from_anchor``,
+  which this checkpoint leaves at its True default; see
+  :func:`vllm_block_width`). ATOM builds ``[anchor, noise x (T-1)]`` at the
+  same T (``deepseek_v4_dspark.py``). Both filler tokens
   resolve to ``hf_config.dspark_noise_token_id`` -- vLLM's
   ``get_parallel_drafting_token_id`` falls through ``dflash_config.mask_token_id``
   and ``mask_token_id`` to it, and V4-Pro-0813 carries only the last. So the two
@@ -57,6 +60,8 @@ metadata. It therefore binds the proxy cache views and enters that context
 itself, mirroring ``model_wrapper.ATOMModelBase.forward``.
 """
 
+import logging
+
 import torch
 
 from atom.models import deepseek_v4 as deepseek_v4_base
@@ -64,19 +69,57 @@ from atom.models.deepseek_v4_dspark import DeepseekV4DSpark as DeepseekV4DSparkB
 from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
 from atom.plugin.vllm.models.deepseek_v4 import DeepseekV4AttentionVllm, IndexerVllm
 
+logger = logging.getLogger("atom")
+
 
 def vllm_block_width(vllm_config) -> int:
     """The draft block's width in vLLM's layout.
 
-    vLLM's speculator sets ``num_query_per_req = 1 + num_speculative_steps`` --
-    one bonus/anchor row plus one per speculative step -- and ATOM's block is
-    ``[anchor, noise x (T-1)]``, so the two Ts are the same number. Derived from
-    the config rather than hardcoded so a depth change cannot desynchronise
-    them; a mismatch would reshape the batch on the wrong stride and draft from
-    the wrong token, costing acceptance silently.
+    ``num_speculative_tokens``, NOT ``1 + num_speculative_tokens``.
+
+    ``DSparkSpeculator.__init__`` branches on ``sample_from_anchor``, which
+    defaults True and which DeepSeek-V4-Pro-0813 does not set (and cannot pick
+    up later: ``SpeculativeConfig`` wraps the draft config in ``EAGLEConfig``
+    only for eagle/eagle3/dflash, so DSpark's draft hf_config IS the target's
+    V4 config). On that branch the anchor is the first PREDICTION position
+    rather than a separate bonus query, so::
+
+        num_query_per_req = num_speculative_steps          # 7, not 8
+        _anchor_idx       = arange(max_num_reqs) * 7
+
+    and vLLM's own lookahead sizing agrees (``config/vllm.py``: "the anchor
+    itself is the first prediction position (no separate bonus query), so it
+    needs exactly num_speculative_tokens lookahead slots").
+
+    Native ATOM lands on the same number by its own route:
+    ``DSparkProposer._resolve_mtp_k`` returns ``num_speculative_tokens`` and
+    ``dspark_proposer.py`` spells ``self.mtp_k`` as "max_seqlen_qo = block
+    width T". So T is 7 on both arms, and ATOM's ``[anchor, noise x (T-1)]``
+    block is byte-identical to vLLM's ``[anchor, MASK x (T-1)]``.
+
+    Getting this wrong is silent and nearly total: at stride 8 over a width-7
+    layout only request 0's anchor is correct and every other request drafts
+    from a MASK row.
+
+    ``sample_from_anchor`` is re-read here rather than assumed, so a checkpoint
+    that does set it False keeps the two layouts in step instead of silently
+    desynchronising them by one again -- this mirrors ``DSparkSpeculator``'s own
+    branch and must keep mirroring it.
     """
     spec = getattr(vllm_config, "speculative_config", None)
-    return 1 + int(getattr(spec, "num_speculative_tokens", 0) or 0)
+    n = int(getattr(spec, "num_speculative_tokens", 0) or 0)
+    draft_cfg = getattr(spec, "draft_model_config", None)
+    hf = getattr(draft_cfg, "hf_config", None)
+    sample_from_anchor = bool(getattr(hf, "sample_from_anchor", True))
+    width = n if sample_from_anchor else 1 + n
+    logger.info(
+        "ATOM plugin: DSpark draft block width T=%d "
+        "(num_speculative_tokens=%d, sample_from_anchor=%s).",
+        width,
+        n,
+        sample_from_anchor,
+    )
+    return width
 
 
 class DeepseekV4DSparkDraft(DeepseekV4DSparkBase):
