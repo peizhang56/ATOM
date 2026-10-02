@@ -206,8 +206,131 @@ The cheapest discriminator: dump the draft's `main_x` (post
 `project_context`) for one request on both arms for the same prompt and compare
 them numerically. If they differ, it is (2) or (3); if they match, it is (1).
 
+**Superseded — see §6.** Reading the three inputs found a concrete defect in
+(1) without needing the dump: it is not the *content* of the context rows that
+is wrong, it is the *positions they are written at*.
+
 ## 5. Stages 4–5 — not started, and Stage 5 should not start
 
 Stage 4's ISL-115k sweep is now differently motivated: it is no longer "confirm
 ATOM's drafter holds up" but "find out whether it is ever better". Stage 5
 (recipe + CI) must wait until §4 is resolved.
+
+---
+
+## 6. Candidate root cause of the 2.44-vs-4.45 gap: rejected rows write the draft's context window at position 0
+
+> **STATUS: code-read, NOT YET MEASURED.** Written down because the node is
+> disposable. By this file's own standard (§3.2, and `CLAUDE.md` §3.2's lesson)
+> it does not count until a fix moves acceptance. Two earlier code-reading
+> diagnoses on this project were wrong; treat this as a hypothesis with an
+> unusually good fit, not a result.
+
+### The mechanism
+
+vLLM's `prepare_dflash_inputs` kernel fills `context_positions` per request
+span `[ctx_start, ctx_end)`
+(`vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:541-567`):
+
+- rows `[0, num_valid_ctx)` → the real target positions;
+- rows `[num_valid_ctx, num_ctx)` — **the rejected suffix** — → **position 0**
+  and `PAD_SLOT_ID`.
+
+vLLM says so itself, and says why it is safe *for vLLM*:
+
+> those rows write no KV and their positions are never consumed
+
+True for **vLLM's** draft, which writes through `slot_mapping` and therefore
+skips `PAD_SLOT_ID`. **Our draft does not.** ATOM owns the draft's KV and
+addresses its rolling SWA ring by *absolute position* — by design, per the
+wrapper's module docstring — so it discards `slot_mappings` and keeps the
+positions:
+
+```
+precompute_and_store_context_kv(hidden, context_positions, slot_mappings)   # slot_mappings ignored
+  -> write_combined_context_kv -> stage.write_context_kv -> swa_write -> _swa_write_kernel
+       dst_row = window_row(slot, pos, ...) = slot*SLOT_ROWS + ring_start + pos % RING_SLOTS
+```
+
+`_swa_write_kernel` gates **only** on `dst_row` bounds — there is no validity
+gate on `pos` — and it writes the **last** `write_n = min(tok_n,
+write_per_batch)` rows of each span, with `write_per_batch = window_size +
+num_spec = 128 + 7 = 135`. A decode span is 7–8 rows, so `write_n` is the whole
+span: **the rejected suffix is written, every step.**
+
+With the measured geometry (`CLAUDE.md` §3.1: `ring_slots=135, ring_stride=135,
+ring_start=34380, slot_rows=43746`), `pos = 0` resolves to ring offset 0 —
+comfortably in bounds, so the bounds guard does not catch it. The write lands.
+
+### Why it is not a harmless write
+
+At acceptance 2.44 with T=7 there are ~4.5 rejected rows per request per step,
+and **all of them collide on ring slot 0** of that request's window.
+
+Is slot 0 live? The read side gathers the last `window_size = 128` positions, so
+for current position `P` it reads slots `(P-127 .. P) mod 135` — 128 of the 135
+slots. Slot 0 is in that set unless `P mod 135 ∈ {128..134}`, i.e. it is live
+**~95% of steps**. A legitimate rewrite of slot 0 only comes around once per 135
+positions, while the corruption recurs every step — so the draft's 128-row
+context window carries a wrong row essentially permanently.
+
+The corrupting value is a *real* hidden state for a token that was rejected,
+i.e. plausible-looking and wrong. And the loop is self-reinforcing: more
+rejection → more corrupt rows → worse context → more rejection.
+
+### Why it fits every observation we have
+
+| observation | fit |
+|---|---|
+| gap is already at **position 1** (0.65 vs 0.90), §4 | ✓ corrupts the shared context window, not block geometry — degrades all positions |
+| **eager ≈ captured** (1.98–2.50 vs 2.07–2.44), §4 | ✓ this write is explicitly eager, outside the captured graph |
+| **native is fine** (4.45) | ✓ native's `compute_draft_kv` passes the target forward's *real* positions for every row |
+| **vLLM's own draft is fine** (4.33) | ✓ it writes via `slot_mapping` and skips `PAD_SLOT_ID` |
+
+The native arm is the sharpest confirmation. `DSparkProposer.compute_draft_kv`'s
+own docstring argues rejected rows are safe to write:
+
+> Rejected rows are harmless -- they land on future positions, unread until the
+> step that accepts them rewrites them.
+
+That argument depends *entirely* on those positions being real future positions.
+vLLM's zeroing destroys exactly the premise, and we inherited the write without
+inheriting the premise.
+
+### The fix, and a corollary that makes it cheap
+
+Note what native's docstring also establishes: those rows are **never read
+before being rewritten**. So *not writing them at all is equivalent to writing
+them* — the fix is simply to gate them out, not to reconstruct their true
+positions.
+
+`slot_mappings` is the available signal and our wrapper already receives it and
+throws it away; `PAD_SLOT_ID` marks exactly these rows. Shape of the change:
+
+- thread an optional `valid_mask` through `write_combined_context_kv` → stage
+  `write_context_kv` → `swa_write` → `_swa_write_kernel`, defaulting to `None`
+  so the **native path stays byte-identical**;
+- in the kernel, skip on `mask[src_id] == 0` — the same idiom
+  `swa_scatter_rows` already applies via `batch_id_per_q_token` ("the same gate
+  the fused writes apply");
+- must be **sync-free**: no `.nonzero()`/`.item()` compaction. This call is
+  eager, but a per-step device→host sync would cost throughput.
+
+`write_context_kv` is outside the compiled region (`deepseek_v4_dspark.py`'s own
+COMPILE BOUNDARY block says it "stays eager"), so this does not violate the
+no-editing-compiled-files rule — **re-read that block before touching the file
+anyway.**
+
+**Caveat to measure, not assume:** `PAD_SLOT_ID` also covers rows whose
+`ctx_block_id == 0` (vLLM's null block, after sliding-window eviction). For
+ATOM's ring those are a *conservative* false positive — a row we could have
+written and skip instead. Expected to be rare (the rows in a span are the
+newest positions, hence resident), but log a counter of masked rows and confirm
+it tracks `num_rejected` rather than exceeding it.
+
+### Next step
+
+Implement the gate, boot the plugin arm, `accept_probe.py --concurrency 32`.
+Acceptance is 2.44 today and 4.45 native; anything that does not move
+materially toward 4.4 falsifies this and sends it back to candidates (2) aux
+hidden states and (3) weight mapping in §4.
