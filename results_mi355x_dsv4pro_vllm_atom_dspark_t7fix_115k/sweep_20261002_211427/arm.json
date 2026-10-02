@@ -1,0 +1,10 @@
+{
+  "written_at": "2026-10-02T21:14:27+00:00",
+  "aiter": {"sha": "503443ff0cc9bbf874276bc49a57bc64e9ca9054", "dirty": false},
+  "ATOM": {"sha": "a460a564558634f27ba938061ebb8e412424a1a3", "dirty": false},
+  "vllm": {"sha": "281cfd5a090631c0367d234ea85142b9b635d51c", "dirty": false},
+  "vllm_version": "0.28.1.dev0+g2cf0a6915.d20261002",
+  "server_pid": 383220,
+  "server_cmdline": ["/opt/venv/bin/python", "/opt/venv/bin/vllm", "serve", "/data/DeepSeek-V4-Pro-0813", "--served-model-name", "/data/DeepSeek-V4-Pro-0813", "--host", "0.0.0.0", "--port", "8000", "--dtype", "auto", "--kv-cache-dtype", "fp8", "--tensor-parallel-size", "8", "--distributed-executor-backend", "mp", "--trust-remote-code", "--gpu-memory-utilization", "0.9", "--max-num-seqs", "512", "--tokenizer-mode", "deepseek_v4", "--no-async-scheduling", "--speculative-config", "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"greedy\"}", "--compilation-config", "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}", "--moe-backend", "aiter"],
+  "server_env": {"AITER_BF16_FP8_MOE_BOUND": "0", "ATOM_BASE_IMAGE": "rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0", "ATOM_MOE_GU_ITLV": "1", "PYTORCH_ROCM_ARCH": "gfx942;gfx950", "VLLM_ENGINE_READY_TIMEOUT_S": "3600", "VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_AITER_MOE": "1", "VLLM_TARGET_DEVICE": "rocm"}
+}

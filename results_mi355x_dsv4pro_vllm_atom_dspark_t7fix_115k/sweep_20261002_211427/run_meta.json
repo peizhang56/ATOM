@@ -1,0 +1,5 @@
+{"model": "/data/DeepSeek-V4-Pro-0813", "url": "http://127.0.0.1:8000", "isl": 115000, "osl": 1000, "cache": 90,
+ "num_prefix_prompts": 8, "concurrency": "16,24,32,64,128",
+ "req_mult": 5, "warmup": 3, "seed": 531150, "gpus": 8,
+ "prompt_source": "per-conc (prefix seed 531150, tails seed+conc)", "unique_tails_per_conc": true,
+ "corpus": "/home/pzhang12/deepseek2/inference-benchmarking/gsm8k-aiperf-pack/gsm8k_corpus.txt", "tps_target": null}

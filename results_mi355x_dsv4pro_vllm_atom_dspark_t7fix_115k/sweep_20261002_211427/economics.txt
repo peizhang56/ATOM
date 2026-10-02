@@ -1,0 +1,17 @@
+date 2026-10-02 | model /data/DeepSeek-V4-Pro-0813 | GPUs/node 8
+pricing: DeepSeek V4 Pro 0813 (model_id deepseek-v4-pro-0813) -- in $1.32/M, out $3.96/M, cache-read $0.044/M
+
+      date  conc  out tok/s/gpu  out tok/s/node  $/gpu/hr  nodes@target
+-----------------------------------------------------------------------
+2026-10-02    16          57.87          462.97      7.97           n/a
+2026-10-02    24          86.70          693.61      7.87           n/a
+2026-10-02    32          98.66          789.28      8.95           n/a
+2026-10-02    64         115.87          926.92     10.51           n/a
+2026-10-02   128         131.90         1055.18     11.97           n/a
+
+Notes:
+  - $/gpu/hr = (input tok/s x input price + output tok/s x output price)
+    x 3600, per GPU. Cached-prefix input tokens are billed at the
+    cache-read rate using the measured prefix cache hit rate.
+
+wrote /home/pzhang12/deepseek2/results_mi355x_dsv4pro_vllm_atom_dspark_t7fix_115k/sweep_20261002_211427/economics.json

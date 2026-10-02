@@ -1,0 +1,25 @@
+model /data/DeepSeek-V4-Pro-0813 | ISL 115000 OSL 1000 | cached prefix 90% | GPUs 8 | prompts: GSM8K
+
+ conc  reqs     ISL  cache%  TTFT p50  TTFT p90  ITL p50  in/s/gpu  out/s/gpu  accept%  acc.len
+-----------------------------------------------------------------------------------------------
+   16    83  115083   80.08       820     29138    21.23    6660.0      57.87    16.13     2.13
+      per-position acceptance %: 42.3, 26.4, 17.2, 11.7, 7.9, 4.8, 2.6
+   24   123  115083   88.98       831      7853    28.44    9977.8      86.70    13.81     1.97
+      per-position acceptance %: 38.7, 22.9, 14.2, 9.3, 6.0, 3.6, 1.9
+   32   163  115083   88.98       836      9450    34.22   11354.2      98.66    13.87     1.97
+      per-position acceptance %: 38.8, 23.3, 14.3, 9.3, 6.0, 3.6, 1.8
+   64   323  115083   88.98       887     18800    61.12   13334.1     115.87    11.79     1.83
+      per-position acceptance %: 35.4, 20.1, 11.8, 7.1, 4.4, 2.5, 1.3
+  128   643  115083   88.98      1469     37344   107.88   15179.1     131.90    24.89     2.74
+      per-position acceptance %: 57.3, 38.9, 27.5, 20.0, 14.7, 10.1, 5.8
+
+Reading these numbers:
+  - accept %   is per drafted token; not comparable across different
+               num_speculative_tokens. Use accept length for that.
+  - TTFT P90   is dominated by cold-start prefill: the first <concurrency>
+               requests each do a full-length prefill. Raising warmup does not
+               remove this. Treat P90 as cold-start-inclusive.
+  - out/s/gpu  is aggregate and includes prefill time, which is not
+               speculatively decoded.
+
+wrote /home/pzhang12/deepseek2/results_mi355x_dsv4pro_vllm_atom_dspark_t7fix_115k/sweep_20261002_211427/report.json
