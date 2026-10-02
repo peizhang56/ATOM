@@ -153,14 +153,58 @@ Two readings, and they need separating before any more work:
 2. ATOM's draft is genuinely weaker at short context, and its advantage only
    appears at 115k. Possible, but it does not explain position 1.
 
+### ANSWERED: reading (1). The plugin wiring is defective.
+
+Ran native ATOM (`serve_dsv4_pro_atom_native_tp8.sh`) on the identical
+workload. Native is the reference implementation of this exact draft, loading
+the same `mtp.{0,1,2}.*` weights from the same checkpoint.
+
+| arm | mean accepted length | GSM8K (strict, full 1319) |
+|---|---:|---:|
+| **native ATOM** | **4.43 – 4.46** | **0.9515** |
+| plugin, vLLM draft | 4.28 – 4.37 | 0.9262 |
+| plugin, **ATOM draft (ours)** | **2.44** | 0.9413 |
+| plugin, spec-OFF | — | 0.9507 |
+
+Native: `Acceptance rate: 49.49%`, accepted-length distribution
+`{0: 8.4%, 1: 11.3%, 2: 18.3%, 3: 16.0%, 4: 13.2%, 5: 12.3%, 6: 7.7%, 7: 12.8%}`.
+
+**The same draft reaches 4.45 natively and 2.44 through our plugin wrapper.**
+So the premise is fine and ATOM's draft is good — *our integration loses ~45%
+of its acceptance*. Reading (2) is dead: it is not that ATOM's draft is weak at
+short context.
+
+Two further things fall out of the native run:
+
+- **Native spec decoding is lossless**: 0.9515 vs the plugin's spec-off 0.9507.
+  So the plugin's spec-on accuracy deficit (§3.2) is *also* an integration
+  issue, not something inherent to DSpark. Both symptoms likely share a cause.
+- Native at short context gets 4.45, not the ~3.3 quoted for ISL 115k in
+  `SESSION-HANDOFF.md`. Those are different regimes; do not mix them.
+
 ### Next step, concrete
 
-Measure the ATOM draft's first-position acceptance against **native ATOM** on
-the same prompts. Native is the reference implementation of this exact draft:
-if native also gives ~0.65 at position 1, reading (2) holds and the premise
-needs re-examining; if native gives ~0.9, the defect is in the plugin wiring
-and is findable by diffing what native feeds `write_context_kv` against what
-the plugin feeds it.
+Find what the plugin feeds the draft that native does not. The draft's quality
+inputs are exactly three, and the first is the prime suspect:
+
+1. **The rolling context window.** `precompute_and_store_context_kv` ->
+   `write_combined_context_kv`. Native drives this from its own proposer with
+   live metadata; the plugin re-enters a *stashed* target forward context
+   (`get_deepseek_v4_target_metadata()`). Under `FULL_DECODE_ONLY` the target's
+   Python does not re-run on replay, so that stash can be stale — the
+   `_mtp_hidden_buffer` hazard, one level up. Check whether the stash is
+   refreshed every step. (Note: eager-vs-captured acceptance is the same here,
+   which argues against staleness being the *whole* story, but the stash may be
+   wrong rather than stale.)
+2. **The aux hidden states** fed to `combine_hidden_states` — wrong layers,
+   wrong mHC reduction, or wrong row ordering would degrade every position
+   uniformly, which matches a position-1 gap.
+3. **Weight mapping.** `f32df74be` fixed 97/97 weights being at *init values*;
+   verify they are mapped to the right parameters, not merely non-zero.
+
+The cheapest discriminator: dump the draft's `main_x` (post
+`project_context`) for one request on both arms for the same prompt and compare
+them numerically. If they differ, it is (2) or (3); if they match, it is (1).
 
 ## 5. Stages 4–5 — not started, and Stage 5 should not start
 
