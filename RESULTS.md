@@ -220,11 +220,12 @@ ATOM's drafter holds up" but "find out whether it is ever better". Stage 5
 
 ## 6. Candidate root cause of the 2.44-vs-4.45 gap: rejected rows write the draft's context window at position 0
 
-> **STATUS: code-read, NOT YET MEASURED.** Written down because the node is
-> disposable. By this file's own standard (§3.2, and `CLAUDE.md` §3.2's lesson)
-> it does not count until a fix moves acceptance. Two earlier code-reading
-> diagnoses on this project were wrong; treat this as a hypothesis with an
-> unusually good fit, not a result.
+> **STATUS: MEASURED. The defect is real and now fixed (`1b3db20d0`). It is
+> NOT the cause of the acceptance gap — acceptance did not move.** The
+> hypothesis below had an unusually good fit and was still wrong about what it
+> explained. That is three code-reading diagnoses on this project that did not
+> survive contact with hardware; the §6.5 numbers, not the §6.1–6.4 reasoning,
+> are the part to trust.
 
 ### The mechanism
 
@@ -328,9 +329,74 @@ written and skip instead. Expected to be rare (the rows in a span are the
 newest positions, hence resident), but log a counter of masked rows and confirm
 it tracks `num_rejected` rather than exceeding it.
 
+### 6.5 What the fix measured: the defect is real, the hypothesis is wrong
+
+Implemented as `1b3db20d0` (optional `valid_mask`, plugin → stage →
+`swa_write` → `_swa_write_kernel`, `None` by default so every native caller is
+byte-identical). `tests/test_swa_write_ring.py` 51 passed, including a new test
+that asserts the **ungated** write does clobber ring slot 0 — so the mechanism
+is confirmed at unit level, not merely read.
+
+Live, `accept_probe.py --concurrency 32`, same node, same session:
+
+| arm | mean accepted length | tok/s |
+|---|---:|---:|
+| plugin, ATOM draft, gate OFF | 2.09 | 1055 |
+| plugin, ATOM draft, **gate ON** | **2.14** | 1208 |
+| (prior sessions, same arm) | 1.98 – 2.50 | — |
+| native ATOM | 4.43 – 4.46 | — |
+
+**No movement.** 2.09 → 2.14 sits inside the arm's own 1.98–2.50 spread.
+
+The gate is definitely active and dropping the right rows — the instrumentation
+shows decode steps of 256 rows (32 requests × 8-wide target spans) with
+155–223 dropped, i.e. ~5–7 rejected rows per request, tracking the ~2.1
+acceptance exactly as predicted:
+
+```
+DSpark draft context gate dropped 221 of 256 rows
+DSpark draft context gate dropped 202 of 256 rows
+DSpark draft context gate dropped 191 of 256 rows
+```
+
+So the rejected rows *were* being written at position 0, the write *was*
+landing on a live window row, and removing it changes **nothing** measurable.
+One corrupted row out of a 128-row context window is apparently not worth 45%
+of acceptance.
+
+Keep the fix: it is a genuine correctness defect with test coverage, it costs
+nothing, and leaving a known-wrong write in place would poison every later
+diagnosis on this path. But it is not the headline.
+
+**Instrumentation note, repeated from Stage 1 and repeated again here:** the
+first attempt logged the first 5 calls and reported "dropped 0 of 4608 rows" —
+all prefill, which has no rejected rows by construction. A diagnostic bounded
+by *call count* lands on warmup/prefill and says nothing. Bound it by the
+*condition* instead. This is the third time this file records that lesson.
+
+### 6.6 Also ruled out, cheaply
+
+`res_preshuffle`. The plugin's aux reconstruction passes
+`hc_post(..., res_preshuffle=hc_state.res_preshuffle)` while native's
+`AuxCaptureSpec` hook (`dspark_proposer.py:502-516`) omits the argument
+entirely, defaulting it False — a real asymmetry. It is inert here:
+`enable_res_preshuffle = aiter.mhc_res_shuffle_enabled(1, "gfx950")` returns
+**False** on this hardware, so both arms reconstruct identically. Would matter
+on gfx1250; does not matter on MI355X.
+
 ### Next step
 
-Implement the gate, boot the plugin arm, `accept_probe.py --concurrency 32`.
-Acceptance is 2.44 today and 4.45 native; anything that does not move
-materially toward 4.4 falsifies this and sends it back to candidates (2) aux
-hidden states and (3) weight mapping in §4.
+Candidates (2) aux hidden states and (3) weight mapping from §4 are still open,
+minus the `res_preshuffle` sub-case. The discriminator named in §4 has not been
+run and is now the thing to run: dump the draft's `main_x` (post
+`project_context`) for one request on both arms for the same prompt and compare
+numerically. Match → the context path; differ → aux or weights.
+
+Worth checking first, since it is nearly free: the plugin selects aux layers via
+`get_eagle3_aux_hidden_state_layers` (`+1` onto the checkpoint's 0-based
+`dspark_target_layer_ids` → `(59, 60, 61)`, consumed as "after
+`self.layers[idx]` where `idx+1 in aux_layers`"). Confirm native's
+`AuxCaptureSpec` registers the **same three layers** and in the **same order** —
+the concat feeding `main_proj` is order-sensitive and a reversed or
+off-by-one-layer triple would degrade every position uniformly, which is the
+shape of what we see.
