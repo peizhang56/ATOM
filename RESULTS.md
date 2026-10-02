@@ -31,13 +31,17 @@ Seed 531150, 8 GPUs, `--cache 90`. Sources:
 
 `in/s/gpu` (the scored metric), and accepted length:
 
+All figures below are from each sweep's generated `report.md` (the
+`benchmark-report` skill). **`report.txt` computes `in/s/gpu` differently — do
+not mix the two.**
+
 | conc | **ATOM draft** | acc.len | vLLM draft | tok/step | spec OFF | **native** | tok/step |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 16 | 6660 | **2.13** | 9038 | 3.309 | 7674 | 4463 | 3.307 |
-| 24 | 9978 | **1.97** | 12860 | 3.124 | 12169 | 10152 | 3.225 |
-| 32 | 11354 | **1.97** | 14141 | 3.207 | 13897 | 15328 | 3.227 |
-| 64 | 13334 | **1.83** | 15717 | 3.008 | 17767 | 23771 | 3.259 |
-| 128 | 15179 | **2.74** | 13940 | 2.379 | **20958** | **32302** | 3.282 |
+| 16 | 7563 | **2.129** | 9038 | 3.309 | 7674 | 4463 | 3.307 |
+| 24 | 10479 | **1.967** | 12860 | 3.124 | 12169 | 10152 | 3.225 |
+| 32 | 11865 | **1.971** | 14141 | 3.207 | 13897 | 15328 | 3.227 |
+| 64 | 13570 | **1.825** | 15717 | 3.008 | 17767 | 23771 | 3.259 |
+| 128 | 15641 | **2.742** | 13940 | 2.379 | **20958** | **32302** | 3.282 |
 
 ATOM-draft per-position acceptance %:
 
@@ -53,14 +57,14 @@ ATOM-draft per-position acceptance %:
 
 - ATOM's draft **does not decay with batch** — 2.13 → 1.83 → 2.74 is roughly
   flat, where vLLM's falls 3.309 → 2.379. At conc 128 it beats vLLM's draft on
-  acceptance (2.74 vs 2.379) and throughput (15179 vs 13940, **+9%**). That is
+  acceptance (2.74 vs 2.379) and throughput (15641 vs 13940, **+12%**). That is
   exactly the behaviour `SESSION-HANDOFF.md` §3 predicted and the reason the
   project exists.
 - But it sits at **~2.0 against native's 3.28**, so it loses at conc 16–64.
 
 **Speculation is currently a net loss at the concurrencies that matter.** At
 conc 128 the plugin with spec OFF (20958) beats both spec arms — vLLM's draft
-(13940) and ours (15179). At conc 64 spec-off also wins. This is the single
+(13940) and ours (15641). At conc 64 spec-off also wins. This is the single
 most important number on the page: today, DSpark in the plugin is worth
 *negative* throughput where the benchmark is heaviest.
 
