@@ -450,8 +450,9 @@ patching the three symbols `DeepseekV4Attention.__init__` reads
 `DeepseekV4DSparkDraft.__init__` uses — so `atom/models/deepseek_v4.py` stays
 untouched (it is `@support_torch_compile`).
 
-WIP saved as `dp-attention-step1-wip.patch` (not committed to the code branch:
-it does not boot yet).
+WIP committed to the code branch as `442555da5`, gated OFF behind
+`ATOM_VLLM_DP_ATTENTION=1` so the default path is byte-identical. It does not
+boot yet; the blocker is named below.
 
 **It fails at weight load:**
 
@@ -467,7 +468,7 @@ against the global TP group**. `LinearBase`'s own comment claims "all
 downstream param sizing / weight_loader narrowing is inherited unchanged" from
 `self.tp_size` — true for the weight, **not for the quant scale path**.
 
-Next step: find where the quant scale derives its TP size (it is not reading
+Next step (from `442555da5`): find where the quant scale derives its TP size (it is not reading
 `self.tp_size`) and make it honour the override, the same way the weight does.
 That is a contained fix in `atom/model_ops/linear.py` / the V4 quant config,
 and it is the only thing between here and a booting replicated-attention arm.

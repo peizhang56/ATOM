@@ -1,2 +1,21 @@
+result*/**
+!result*/**/
+!result*/*/report.md
+!result*/*/report.txt
+!result*/*/run_meta.json
+!result*/*/arm.json
+!result*/*.md
+# lm_eval writes its scores one level deeper, under a sanitised model name.
+# Small (tens of KB) and it is the score itself, so it is versioned; the
+# accompanying lm_eval.log is not.
+!result*/*/*/results_*.json
+
 __pycache__/
 *.pyc
+
+# Server/client logs -- vLLM startup spam, MB per run.
+logs/*
+!logs/.gitkeep
+
+inference-benchmarking/
+

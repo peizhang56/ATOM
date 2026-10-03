@@ -46,6 +46,19 @@ long-running job.** A finding that exists only in this node's filesystem is a
 finding you are about to lose. The worklog branch is cheap — logs included, the
 whole thing is ~210 KB.
 
+**NEVER create `.patch` files.** Not for work-in-progress, not for "preserving"
+a change, not for handing work to the next session. A commit is the only
+durable form here, and writing a patch costs tokens to produce and tokens to
+re-read while being strictly worse than a commit: it is not attributable, not
+diffable against history, and silently rots against the branch.
+
+Work that does not boot is still committed — put it on the code branch with the
+feature **gated off by default** (an env var or a `False` constant), say so in
+the subject line, and name the blocker in the body. `442555da5` is the pattern:
+`wip(...): ... (gated OFF)`, default path byte-identical, known blocker spelled
+out. Then push. If a change should not survive at all, revert it; do not park
+it in a file.
+
 ```bash
 # code
 cd /app/ATOM && git push upstream HEAD
