@@ -2507,6 +2507,12 @@ class RowParallelLinear(LinearBase):
         **kwargs,
     ):
         self.tp_rank = get_tp_group().rank_in_group
+        # Forward **kwargs: this signature accepts them and used to drop them on
+        # the floor, so `override_tp_size` / `override_tp_rank` silently did
+        # nothing here while ColumnParallelLinear honoured them. A pair built
+        # from one override then disagrees -- the column half replicates, the
+        # row half stays sharded -- and the mismatch only surfaces much later
+        # inside the fused GEMM as a w_scale/weight block mismatch.
         super().__init__(
             input_size,
             output_size,
@@ -2516,6 +2522,7 @@ class RowParallelLinear(LinearBase):
             reduce_results=reduce_results,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
+            **kwargs,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):

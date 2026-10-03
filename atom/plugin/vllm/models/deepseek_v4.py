@@ -309,7 +309,22 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
         every rank still computes every request, so output is unchanged and
         throughput is not yet better. The request split + all-gather is step 2.
         """
-        if not dp_attention_enabled():
+        # Target layers only. The DSpark draft's stages are built through this
+        # same class -- `DeepseekV4DSparkDraft.__init__` rebinds
+        # `DeepseekV4Attention` to it -- and they are numbered ABOVE the
+        # target's depth (`DSparkLayer(args.n_layers + i, ...)`). Replicating
+        # them is both pointless (the draft owns a private SWA ring, not the
+        # per-request latent whose re-reading DP attention exists to avoid) and
+        # wrong: their checkpoint scales are TP-sharded, so a replicated weight
+        # meets a shard-sized w_scale and the fused GEMM rejects it
+        # ("w_scale (56, 16) is no ... block of a 7168 x 16384 weight").
+        layer_id = kwargs.get("layer_id", args[0] if args else None)
+        model_args = kwargs.get("args", args[1] if len(args) > 1 else None)
+        n_layers = getattr(model_args, "n_layers", None)
+        is_draft_stage = (
+            layer_id is not None and n_layers is not None and layer_id >= n_layers
+        )
+        if not dp_attention_enabled() or is_draft_stage:
             super().__init__(*args, **kwargs)
             return
 
