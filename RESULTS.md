@@ -296,8 +296,15 @@ Measured by running **native with the plugin's configuration**, probe regime,
 | cause | cost in accepted tokens |
 |---|---:|
 | fp4 → fp8 indexer | **−0.62** |
-| DP attention + TBO off | **−0.33** |
+| DP attention + TBO off | **−0.33** at ~80 tokens — **but ~0 at the goal regime**, see below |
 | **our integration** | **−1.36** |
+
+> **CORRECTED.** `kb/e2-gap-is-dpa-tbo-*.md` measured acceptance at ISL 115k
+> with DPA and TBO removed: `tok/step` at conc 128 is **native full 3.282 vs
+> native−DPA−TBO 3.306** — unchanged. So the −0.33 above is a short-context
+> probe artifact, not a real acceptance effect. At the goal regime the only
+> config term that may cost acceptance is the **fp4 indexer** (−0.62 measured
+> at short context, still unverified at 115k).
 
 ### Consequences
 
@@ -322,3 +329,67 @@ from the native script by flag substitution), then
 `grep "MTP Stats " logs/<log>`. With DP on, the batch splits across 8 engines,
 so a small probe never reaches the per-engine stats threshold — use `--requests
 160` or larger.
+
+---
+
+## 10. Driver localized, and the DP-attention design (2026-10-03)
+
+### 10.1 Every draft input is now proven equivalent
+
+With the config matched (`serve_native_plugincfg.sh`: no DPA, no TBO, fp8
+indexer), the plugin's draft inputs are indistinguishable from native's:
+
+| | control (A vs A) | plugin vs native |
+|---|---:|---:|
+| `aux_concat` rel err | 7.37% | **7.44%** |
+| `main_x` rel err | 13.11% | **12.91%** |
+
+Both at or below the same-arm floor. Together with the integer round-trip on
+window addressing, the position/coverage census, and the identical no-context
+floors, **every input the draft consumes is equivalent** — yet the output
+differs by 1.36 tokens (3.50 vs 2.14).
+
+`sample_indices` is also eliminated: under `SAMPLE_FROM_ANCHOR` the vLLM kernel
+stores `sample_idx = req*7 + query_off` ← `query_idx = req*7 + query_off`, the
+identity, so vLLM reads exactly the row ATOM's block produced.
+
+**What remains is the drafting loop itself** — vLLM's `DSparkSpeculator`
+driving ATOM's model instead of ATOM's `DSparkProposer`. That is now evidence,
+not preference, and it points at the re-design being about the *driver*.
+
+### 10.2 DP attention in the plugin — design and prior art
+
+`kb/e1-*` is a **negative result, do not re-run**: vLLM's
+`--data-parallel-size 8 --enable-expert-parallel` is 2.0–4.7x WORSE, because it
+is 8 independent engine cores each with its own scheduler, KV pool and prefix
+cache (which fragments to 38.9% at conc 16), plus expert-parallel MoE.
+
+`kb/e3-*`: **DP attention is the entire throughput gap** (1.95x at conc 64,
+2.31x at 128). **TBO is a net 4–8% LOSS** as configured — ATOM's own recipe
+pairs it with `GPU_MAX_HW_QUEUES=5` + `ATOM_NUMA_BIND=1`, which the baseline
+script does not set. **Do not port TBO.**
+
+ATOM's flavour is DP *inside* a TP group: one scheduler, one KV pool, one
+prefix cache; only the attention op is sharded by request, hidden states
+all-gathered around it, MoE stays TP.
+
+Feasibility notes gathered:
+
+- `atom/plugin/config.py` **already implements the DP-attention rank layout for
+  SGLang** (`runtime_tp_size`/`runtime_dp_size`/rank mapping). Only the vLLM
+  plugin hardcodes `enable_dp_attention=False`
+  (`atom/plugin/vllm/platform.py:81` explains why: it is a rank-layout decision
+  in ATOM's engine, which plugin mode replaces with vLLM's `GPUModelRunner`).
+- V4's attention linears are **ATOM's own** (`atom.model_ops.linear`), not
+  vLLM's, so ATOM controls their sharding. They size from
+  `get_tp_group().world_size`.
+- With MLA under TP every rank already holds the same latent, so DP attention
+  needs **no KV redistribution** — only a work split plus an all-gather.
+
+Sketch: let the vLLM plugin accept `enable_dp_attention`, give the attention
+linears a size-1 TP group (replicated weights) while MoE stays TP, and have the
+V4 proxy attention op select its 1/N of requests and all-gather the hidden
+states back.
+
+**Make-or-break check, not yet done:** whether the plugin's load path can give
+attention replicated weights while MoE stays sharded.
