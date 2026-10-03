@@ -477,3 +477,69 @@ Note the existing production user of this override (`attention_mla.py:414`,
 DCP) passes `override_tp_size = tp_size // dcp_size`, which at `tp == dcp` is 1
 but more usually divides evenly into the shard — so the scale path may never
 have been exercised at a *coarser* grid than the checkpoint's own sharding.
+
+### 10.5 DP attention step 1 LANDED (`9aa7f0385`), and the step 2 design
+
+**Step 1 works.** Replicated target attention weights under the plugin, gated
+`ATOM_VLLM_DP_ATTENTION=1`, default path byte-identical.
+
+| check | result |
+|---|---|
+| boots | yes |
+| output | identical completion to every other arm |
+| acceptance | 2.12 vs 2.14 baseline — unchanged, as designed |
+| KV cost | 3,256,960 vs 3,644,928 tokens, **−10.6%** (predicted ~11%) |
+
+Two defects had to be fixed:
+
+1. **`RowParallelLinear.__init__` accepted `**kwargs` and dropped them**, so
+   `override_tp_size` silently did nothing there while `ColumnParallelLinear`
+   honoured it. A `wo_a`/`wo_b` pair then disagreed — column replicated, row
+   sharded — and the mismatch surfaced only inside the fused GEMM as a
+   w_scale/weight block mismatch, because scale and weight were sized against
+   different tp values (`linear.py:761` sizes the scale from
+   `self.output_size`/`self.input_size`, which `LinearBase` divides by
+   `self.tp_size`). A latent bug: nothing had passed those kwargs before,
+   because the one existing user of the override (DCP, `attention_mla.py:414`)
+   only goes through `ColumnParallelLinear`.
+2. **The DSpark draft's stages must not be replicated.** They are built through
+   the same attention class (`DeepseekV4DSparkDraft.__init__` rebinds it) but
+   own a private SWA ring rather than the per-request latent, and their
+   checkpoint scales are TP-sharded. Gated on `layer_id >= args.n_layers`.
+
+### Step 2 — where the speedup actually is
+
+Step 1 has every rank still computing every request, so there is no speedup
+yet. Step 2 shards the attention work by request. The 1.95x/2.31x is all here.
+
+**Writes must stay replicated; only the read may be sharded.** This is the
+constraint that kb/e1 discovered the hard way. If each rank wrote only its own
+requests' KV, a prefix-cache hit against a request that lived on another rank
+would find nothing — which is exactly how vLLM's DP fragmented the cache to
+38.9%. Writes are one row per token and cheap; the ~662 MB/request **read** is
+the entire cost. So: all ranks write all KV, each rank reads and computes only
+its own requests, then the outputs are combined.
+
+The two halves are already separable: `qk_norm_rope_maybe_quant` performs the
+KV write, `_sparse_attention` performs the read — and the plugin subclass
+already overrides `_sparse_attention`.
+
+**Combining:** zero-fill the rows a rank does not own and `all_reduce(sum)`.
+Each row is produced by exactly one rank, so the sum is a gather. This is
+traffic-neutral rather than additional: with replicated weights `wo_b` has
+`tp_size=1` and no longer performs its usual all-reduce, so this replaces it.
+
+**The implementation problem.** The sparse-attention kernel reads per-token
+metadata (`batch_id_per_q_token`, `kv_indptr_*`, `qo_indptr`), so the input
+cannot simply be row-sliced — the metadata would have to be rebuilt for the
+subset. The cheaper lever is to give a rank's non-owned query rows **zero-length
+CSR ranges**, so the kernel performs no KV read for them and the unchanged
+kernel does the skipping.
+
+**Open question, to check first:** whether the decode kernel handles an empty
+CSR range gracefully (softmax over no keys). `attn_sink` may cover it. If it
+does not, the fallback is rebuilding the metadata for the owned subset.
+
+**Request→rank assignment must be stable** for a request's lifetime, or its
+rolling state follows the wrong rank. `state_slot_out` is stable per request
+and is the natural key (`rank = slot % world_size`).
