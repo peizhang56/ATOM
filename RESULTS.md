@@ -439,3 +439,40 @@ weights on every rank instead of sharding them costs memory — order +6 GB/rank
 by a rough count over 61 layers. If that does not fit alongside the KV pool,
 this shape needs rework (e.g. keep attention TP-sharded and instead shard the
 *KV read* by request, which is where the cost actually is).
+
+### 10.4 DP attention step 1 attempted — blocked on the quant-scale TP source
+
+Implemented replicated attention weights in the plugin subclass
+(`DeepseekV4AttentionVllm.__init__`), env-gated `ATOM_VLLM_DP_ATTENTION=1`, by
+patching the three symbols `DeepseekV4Attention.__init__` reads
+(`get_tensor_model_parallel_world_size`, `ColumnParallelLinear`,
+`RowParallelLinear`) inside a try/finally — the same idiom
+`DeepseekV4DSparkDraft.__init__` uses — so `atom/models/deepseek_v4.py` stays
+untouched (it is `@support_torch_compile`).
+
+WIP saved as `dp-attention-step1-wip.patch` (not committed to the code branch:
+it does not boot yet).
+
+**It fails at weight load:**
+
+```
+RuntimeError: w_scale (56, 16) is no ('32x32','128x128','1x32','1x128')
+             block of a 7168 x 16384 weight
+```
+
+`(56, 16)` is exactly the 128x128 block-quant scale of a **7168 x 2048**
+tensor, and 2048 = 16384/8. So the layer correctly allocates the FULL output
+width (the override took effect), but the **fp8 quant scale is still sized
+against the global TP group**. `LinearBase`'s own comment claims "all
+downstream param sizing / weight_loader narrowing is inherited unchanged" from
+`self.tp_size` — true for the weight, **not for the quant scale path**.
+
+Next step: find where the quant scale derives its TP size (it is not reading
+`self.tp_size`) and make it honour the override, the same way the weight does.
+That is a contained fix in `atom/model_ops/linear.py` / the V4 quant config,
+and it is the only thing between here and a booting replicated-attention arm.
+
+Note the existing production user of this override (`attention_mla.py:414`,
+DCP) passes `override_tp_size = tp_size // dcp_size`, which at `tp == dcp` is 1
+but more usually divides evenly into the shard — so the scale path may never
+have been exercised at a *coarser* grid than the checkpoint's own sharding.
