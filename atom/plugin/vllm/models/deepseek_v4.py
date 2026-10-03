@@ -428,7 +428,10 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
         mask = self._dp_owner_mask(out.size(0), out.device)
         if mask is None:
             return out
-        out = out * mask.unsqueeze(-1).to(out.dtype)
+        # `where`, not a multiply: once step 2b gives unowned rows empty CSR
+        # ranges their softmax has no keys, so they may come back NaN -- and
+        # NaN * 0 is NaN, which the all-reduce would then spread to every rank.
+        out = torch.where(mask.unsqueeze(-1), out, torch.zeros_like(out))
         return tensor_model_parallel_all_reduce(out)
 
     def _sparse_attention(

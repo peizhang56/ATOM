@@ -1822,6 +1822,14 @@ def _make_decode_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
     )
 
 
+def _v4_dp_attention_enabled() -> bool:
+    """Mirrors `models.deepseek_v4.dp_attention_enabled`; inlined to avoid an
+    import cycle between the bridge and the model wrapper."""
+    import os
+
+    return os.environ.get("ATOM_VLLM_DP_ATTENTION") == "1"
+
+
 def _populate_decode_persistent(md, common, pos_np, bufs, total, T_pad, positions_gpu):
     """Decode index/indptr build into persistent fixed-address buffers.
 
@@ -1852,6 +1860,40 @@ def _populate_decode_persistent(md, common, pos_np, bufs, total, T_pad, position
         if T_pad > total:
             out[total + 1 :] = out[total]
         return out
+
+    # DP attention: give the query rows this rank does NOT own zero-length CSR
+    # ranges, so the unchanged decode kernel performs no KV read for them. That
+    # read -- every rank pulling every request's full latent, which MLA does not
+    # shard because the latent is shared across heads -- is the entire cost DP
+    # attention exists to remove.
+    #
+    # Only the READ is sharded. Every rank still WRITES every token's KV
+    # (`dest_rows` below is untouched), because a rank that held only its own
+    # requests' blocks would miss a prefix-cache hit against a request that
+    # lived on another rank -- which is how vLLM's own data parallelism
+    # fragmented this model's cache to 38.9% (kb/e1). Writes are one row per
+    # token; the read is ~662 MB per request at 115k.
+    #
+    # Ownership is `state_slot % world_size`: the slot is held for the
+    # request's lifetime, so the assignment cannot move between steps, and
+    # every rank already agrees on it.
+    if _v4_dp_attention_enabled() and total:
+        from aiter.dist.parallel_state import get_tp_group as _tpg
+
+        _world = _tpg().world_size
+        if _world > 1:
+            _bh = bufs.batch_id.np[:total]
+            _sh = np.asarray(md.state_slot_mapping_cpu)
+            _own = (_sh[_bh] % _world) == _tpg().rank_in_group
+            # ONE entry, not zero. A zero-length range faults the decode
+            # kernel ("Memory access fault ... on address (nil)") -- it does
+            # not guard an empty row. One entry is read instead of up to
+            # `win` + `index_topk`, so the saving is the same to within a
+            # rounding error, and the row's output is discarded by
+            # `_dp_combine` anyway.
+            actual_swa = np.where(_own, actual_swa, 1).astype(np.int32)
+            csa_valid_k = np.where(_own, csa_valid_k, 0).astype(np.int32)
+            n_h_per_token = np.where(_own, n_h_per_token, 0).astype(np.int32)
 
     swa_indptr = _indptr(actual_swa)
     csa_indptr = _indptr(actual_swa + csa_valid_k)
