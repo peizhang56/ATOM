@@ -452,6 +452,12 @@ before touching that file. Instrument at call sites instead:
 `ModelRunner.run_model()`, `DSparkProposer.propose()`, or the plugin wrapper's
 methods, which are outside every compiled region.
 
+**On a `Memory access fault`, use `rocgdb`** — do not guess from the Python
+traceback. The fault is reported asynchronously, so the frame it lands on is
+usually unrelated to the kernel that wrote out of bounds. (2026-10-03: a
+zero-length CSR row faulted the V4 decode kernel at "address (nil)"; the
+Python stack pointed at an engine shutdown.)
+
 **`rm -rf /root/.cache/atom/*` before restarting** after code changes — stale
 compile cache causes silent failures.
 
