@@ -543,3 +543,45 @@ does not, the fallback is rebuilding the metadata for the owned subset.
 **Request→rank assignment must be stable** for a request's lifetime, or its
 rolling state follows the wrong rank. `state_slot_out` is stable per request
 and is the natural key (`rank = slot % world_size`).
+
+### 10.6 DP attention steps 2a/2b measured at 115k: a 38% REGRESSION
+
+`results_mi355x_dsv4pro_vllm_atom_dpattn_115k/sweep_20261003_054526`, ATOM
+`fa4134ef8`, `ATOM_VLLM_DP_ATTENTION=1`.
+
+| conc | DP attn ON | baseline (no DP) | | ITL p50 |
+|---:|---:|---:|---:|---|
+| 16 | 4705 | 7563 | **−38%** | 30.9 vs 21.2 ms |
+| 24 | 6864 | 10479 | **−35%** | 42.6 vs 28.4 ms |
+| 32 | 7394 | 11865 | **−38%** | 53.8 vs 34.2 ms |
+
+**Cause: the read was sharded, the compute was not.** With replicated weights
+every rank runs the Q/K/V/O projections for ALL heads on ALL tokens — 8x the
+attention-projection FLOPs per rank versus TP, where each rank did `n_heads/8`
+— and `_dp_combine` then discards seven eighths of that. The KV read saved does
+not come close to paying for it.
+
+Masking after the fact cannot work. A rank must not *compute* rows it does not
+own, which means slicing the token rows at the INPUT to the attention block,
+before the projections — and therefore rebuilding `batch_id_per_q_token`,
+`kv_indptr_*`, `qo_indptr`, `block_tables_per_token` and the compress plans for
+the owned subset, which is exactly the metadata surgery steps 2a/2b were
+written to avoid.
+
+So the gated feature stands at: correct, and slower. Keep it off.
+
+**Step 2c, the real shape:**
+
+1. Build the owned-subset metadata in the bridge (same builders, fed a filtered
+   token list), rather than masking a full-width build.
+2. Slice `x`/`positions` to the owned rows on entry to the attention block.
+3. Scatter the result back to full width and all-reduce, as 2a already does.
+4. Keep KV writes at full width (unchanged) so prefix caching still works —
+   that constraint from `kb/e1` is unaffected and still holds.
+
+Two things from 2b worth keeping regardless:
+
+- a zero-length CSR row **faults** the decode kernel ("Memory access fault ...
+  on address (nil)"); it does not guard empty rows. Length-1 is the workaround.
+- `RowParallelLinear` silently dropped `**kwargs`, so `override_tp_size` did
+  nothing there (fixed in `9aa7f0385`) — a latent bug independent of this work.
