@@ -201,8 +201,32 @@ class DeepseekV4DSparkDraft(DeepseekV4DSparkBase):
         num_blocks = max(1, total // T)
         anchor_idx = torch.arange(num_blocks, device=input_ids.device) * T
         anchor_idx = anchor_idx.clamp(max=total - 1)
+        # THE TWO ARMS NUMBER THE ANCHOR DIFFERENTLY, AND IT IS OFF BY ONE.
+        #
+        # vLLM's `positions` is per-TOKEN: `_prepare_dflash_inputs_kernel` writes
+        # `query_pos = last_valid_pos + 1 + query_off`, so column 0 carries the
+        # position of the anchor TOKEN itself -- one past the last row the target
+        # actually forwarded. vLLM's own draft wants exactly that, because it
+        # RoPEs each block token at the position it is handed.
+        #
+        # ATOM's `block_backbone` wants the other end of the same edge: it
+        # derives the block from the anchor, `_build_block_plan` spelling it
+        # `draft_pos = positions + 1 .. positions + T` and the rolling window
+        # `[anchor - W + 1, anchor]`. Native supplies it as
+        # `target_positions[last_token_indices]` -- the position of the row whose
+        # logits produced the anchor token, which is `last_valid_pos`.
+        #
+        # So the translation is `-1`, and without it two things go wrong at once:
+        # every drafted token is RoPE'd one position too far, and the window's
+        # newest row is a position the target has never forwarded. Measured, with
+        # `ATOM_DSPARK_WINDOW_AUDIT`: that row is stale on 100% of steps -- it
+        # reads -1 before the ring wraps and a 135-position-old row after.
+        #
+        # `clamp(min=0)` is for dummy and profiling batches only, whose positions
+        # are all zero; a real anchor is `last_valid_pos + 1 >= 1`.
+        anchor_positions = (positions[anchor_idx] - 1).clamp(min=0)
         normed, _hc_hidden = self.block_backbone(
-            input_ids[anchor_idx], positions[anchor_idx], T
+            input_ids[anchor_idx], anchor_positions, T
         )
         # vLLM indexes the result by its own token count, so return that many
         # rows: truncate a short batch's block, zero-fill a padded tail.
