@@ -731,6 +731,19 @@ class DSparkLayer(Block):  # type: ignore[misc]
         B = fc.context.scheduled_bs
         cu_seqlens_q = attn_md.cu_seqlens_q[: B + 1]
         a = self.attn
+        # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set. Stage 0 only:
+        # every stage writes the same (slot, position) pairs into its own plane,
+        # so one stage's stamps describe them all.
+        if self.stage_id == 0:
+            from atom.models.dspark_window_audit import note_writes
+
+            note_writes(
+                a.swa_window,
+                attn_md.state_slot_out[:B],
+                cu_seqlens_q,
+                positions,
+                self.write_per_batch,
+            )
         # An fp8 window is the planes' own 2buff layout, so the verified target
         # KV is quantized for real on its way in and scattered across both
         # planes, exactly as the draft block's own KV is by the fused quant in
@@ -845,6 +858,11 @@ class DSparkLayer(Block):  # type: ignore[misc]
             bufs = self.index_buffers(T, W, x.device)
             if self.stage_id == 0:
                 bufs.build(a.swa_window, slots, positions)
+                # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set: how
+                # much of the window `build` just claimed was ever written.
+                from atom.models.dspark_window_audit import note_reads
+
+                note_reads(a.swa_window, slots, positions, W)
             kv_indices, kv_indptr, draft_rows = bufs.views(B)
             batch_ids = bufs.batch_ids[: B * T]
 
