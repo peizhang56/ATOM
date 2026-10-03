@@ -393,3 +393,49 @@ states back.
 
 **Make-or-break check, not yet done:** whether the plugin's load path can give
 attention replicated weights while MoE stays sharded.
+
+### 10.3 DP attention under vLLM: why native's shape does not port, and what does
+
+Native's `--enable-dp-attention` is **not** an attention-local change. With
+`-tp 8` it computes `runtime_tp_size = tp_size // dp_size = 1`, so the WHOLE
+model runs `tp=1 / dp=8`, and MoE compensates by flattening DP into EP
+(`atom/model_ops/moe.py:256-267`). V4's model code reads the flag only for MoE
+routing gather (`deepseek_v4.py:4823`) — never for attention weight sharding.
+
+What makes native fast is therefore not the parallel layout alone but that
+ATOM's engine keeps **one scheduler, one KV pool, one prefix cache** across the
+8 DP ranks. vLLM's `--data-parallel-size` gives 8 *independent* engines, each
+with its own scheduler/KV pool/prefix cache — which is exactly why `kb/e1`
+measured it 2.0–4.7x worse, with prefix cache hit rate falling to 38.9%.
+
+**So native's shape cannot be ported directly.** The mismatch is the engine.
+
+Proposed shape, inside vLLM's one-scheduler TP engine:
+
+| | native | vLLM DP (e1, failed) | proposed |
+|---|---|---|---|
+| scheduler / KV pool | 1 | 8 | **1** (vLLM TP) |
+| attention weights | replicated (tp=1) | sharded per engine | **replicated, `override_tp_size=1`** |
+| attention work | 1/8 of requests | 1/8, separate pools | **1/8 of requests + all-gather** |
+| MoE | EP across DP | EP | **TP-8, unchanged** |
+
+Supporting facts gathered:
+
+- `override_tp_size` / `override_tp_rank` already exist on `LinearBase`
+  (`atom/model_ops/linear.py:555`) and are in production use for
+  decode-context-parallel (`attention_mla.py:414`). Per-module TP override is
+  existing machinery.
+- V4's attention linears are ATOM's own (`atom.model_ops.linear`), so ATOM
+  controls their sharding; they size from `get_tp_group().world_size`, which in
+  plugin mode wraps vLLM's TP group (`atom/plugin/vllm/tp_group_reuse.py`).
+- Under MLA every TP rank already holds the same latent, so DP attention needs
+  **no KV redistribution** — only a work split plus an all-gather of hidden
+  states. The expensive part (each rank reading every request's ~662 MB latent
+  at 115k) is exactly what the split removes.
+- `enable_dp_attention=False` is hardcoded at `atom/plugin/config.py:419`.
+
+**Open risk, must be checked before building:** replicating V4's attention
+weights on every rank instead of sharding them costs memory — order +6 GB/rank
+by a rough count over 61 layers. If that does not fit alongside the KV pool,
+this shape needs rework (e.g. keep attention TP-sharded and instead shard the
+*KV read* by request, which is where the cost actually is).
