@@ -234,6 +234,14 @@ class IndexerVllm(IndexerBase):
         return topk_local  # [total_tokens, index_topk] int32, raw seq-local
 
 
+def dp_attention_enabled() -> bool:
+    """Plugin-mode DP attention gate. OFF by default; see
+    :meth:`DeepseekV4AttentionVllm.__init__` for what it changes and why."""
+    import os
+
+    return os.environ.get("ATOM_VLLM_DP_ATTENTION") == "1"
+
+
 class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
     """DeepSeek-V4 attention with vLLM piecewise-CUDA-graph reconciliation.
 
@@ -271,6 +279,68 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
     the bucket, so it runs at the padded width and must NOT be sliced. The padded
     rows are never sampled (``logits_indices`` reference real positions only).
     """
+
+    def __init__(self, *args, **kwargs):
+        """Optionally build this attention REPLICATED rather than TP-sharded.
+
+        DP attention needs every rank to hold all heads so it can own a slice of
+        the REQUESTS instead of a slice of the heads. Native gets there by
+        running the whole model at ``runtime_tp_size = tp // dp = 1`` with MoE
+        flattened into EP; that shape cannot port, because what makes it fast is
+        ATOM's engine keeping one scheduler / KV pool / prefix cache across the
+        DP ranks, and vLLM's ``--data-parallel-size`` gives eight independent
+        engines instead (measured 2.0-4.7x WORSE -- `kb/e1`).
+
+        So the plugin keeps vLLM's single-scheduler TP engine and makes only the
+        ATTENTION replicated, leaving MoE on TP. Under MLA every rank already
+        holds the same latent, so no KV moves: the win is purely that a rank
+        stops reading all eight requests' latents every step.
+
+        Done by patching the symbols ``DeepseekV4Attention.__init__`` reads --
+        the same try/finally idiom ``DeepseekV4DSparkDraft.__init__`` uses to
+        rebind the attention/indexer classes -- so
+        ``atom/models/deepseek_v4.py`` stays untouched (it is
+        ``@support_torch_compile``; see ATOM's CLAUDE.md critical rules).
+
+        Costs +16.5 GiB/rank of weights (2.36 -> 18.87), i.e. ~11% of the KV
+        pool, against 1.95-2.31x of decode step time (`kb/e3`).
+
+        OFF unless ``ATOM_VLLM_DP_ATTENTION=1``. Step 1 is correctness only:
+        every rank still computes every request, so output is unchanged and
+        throughput is not yet better. The request split + all-gather is step 2.
+        """
+        if not dp_attention_enabled():
+            super().__init__(*args, **kwargs)
+            return
+
+        base = deepseek_v4_base
+        saved = {
+            n: getattr(base, n)
+            for n in (
+                "get_tensor_model_parallel_world_size",
+                "ColumnParallelLinear",
+                "RowParallelLinear",
+            )
+        }
+
+        def _replicated(cls):
+            class _Rep(cls):
+                def __init__(self, *a, **kw):
+                    kw.setdefault("override_tp_size", 1)
+                    kw.setdefault("override_tp_rank", 0)
+                    super().__init__(*a, **kw)
+
+            _Rep.__name__ = f"Replicated{cls.__name__}"
+            return _Rep
+
+        base.get_tensor_model_parallel_world_size = lambda: 1
+        base.ColumnParallelLinear = _replicated(saved["ColumnParallelLinear"])
+        base.RowParallelLinear = _replicated(saved["RowParallelLinear"])
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            for n, v in saved.items():
+                setattr(base, n, v)
 
     def forward_impl(
         self,
