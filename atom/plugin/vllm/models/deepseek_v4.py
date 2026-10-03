@@ -16,6 +16,10 @@ import dataclasses
 
 import torch
 
+from aiter.dist.parallel_state import get_tp_group
+from atom.model_ops.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
 from atom.models import deepseek_v4 as deepseek_v4_base
 
 # isort: off
@@ -373,8 +377,59 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                 num_real = bid.shape[0] if bid is not None else num_in
                 if num_real < num_in:
                     out = super().forward_impl(x[:num_real], positions[:num_real])
-                    return torch.nn.functional.pad(out, (0, 0, 0, num_in - num_real))
-        return super().forward_impl(x, positions)
+                    out = torch.nn.functional.pad(out, (0, 0, 0, num_in - num_real))
+                    return self._dp_combine(out)
+        return self._dp_combine(super().forward_impl(x, positions))
+
+    def _dp_owner_mask(self, num_tokens: int, device) -> torch.Tensor | None:
+        """``[num_tokens]`` bool: rows whose REQUEST this rank owns, or None.
+
+        Assignment must be stable for a request's lifetime, or its rolling
+        per-request state would follow a different rank between steps.
+        ``state_slot_out`` is exactly that -- the per-request slot, held from
+        admission to completion -- so ``slot % world_size`` is a stable key that
+        needs no extra bookkeeping and no agreement between ranks beyond the
+        slot they already share.
+        """
+        fc = get_forward_context()
+        if fc.context.is_dummy_run:
+            return None
+        md = fc.attn_metadata
+        bid = getattr(md, "batch_id_per_q_token", None)
+        slots = getattr(md, "state_slot_out", None)
+        if bid is None or slots is None:
+            return None
+        world = get_tp_group().world_size
+        if world <= 1:
+            return None
+        bid = bid[:num_tokens]
+        # Padded rows carry bid < 0 and are owned by nobody; clamp only to keep
+        # the gather in range, then drop them with the same test.
+        owner = torch.where(
+            bid >= 0, slots[bid.clamp(min=0).long()] % world, bid.new_full((), -1)
+        )
+        return owner == get_tp_group().rank_in_group
+
+    def _dp_combine(self, out: torch.Tensor) -> torch.Tensor:
+        """Keep only this rank's rows, then sum across ranks.
+
+        Each row is produced by exactly one rank, so the sum IS the gather.
+        Traffic-neutral rather than additional: with replicated weights ``wo_b``
+        has ``tp_size == 1`` and no longer performs its own all-reduce, so this
+        replaces that collective rather than adding one.
+
+        STEP 2a: every rank still COMPUTES every row and discards the ones it
+        does not own, so this is correctness-only -- it validates the
+        assignment, the mask and the collective. Step 2b makes the kernel skip
+        the KV read for unowned rows, which is where the 1.95x/2.31x is.
+        """
+        if not dp_attention_enabled():
+            return out
+        mask = self._dp_owner_mask(out.size(0), out.device)
+        if mask is None:
+            return out
+        out = out * mask.unsqueeze(-1).to(out.dtype)
+        return tensor_model_parallel_all_reduce(out)
 
     def _sparse_attention(
         self,
