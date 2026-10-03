@@ -2,6 +2,12 @@
 
 Re-design and re-implementation, starting from a clean tree. 2026-10-02.
 
+> **Start with [`SESSION-HANDOFF-2026-10-03.md`](SESSION-HANDOFF-2026-10-03.md).**
+> It carries the current state, the first 115k sweep of this arm, the full
+> elimination list, and the corrections to this file (§5 there — several
+> statements below are now known wrong, including the 4.45 reference and
+> "FP4 indexer is not in scope for correctness").
+
 The previous attempt is described in `SESSION-HANDOFF.md`. It is kept for its
 *measurements*, which are sound, and for its list of dead ends. Its
 **architecture is not the one to rebuild** — see §2.
