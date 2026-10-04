@@ -2,11 +2,22 @@
 
 Re-design and re-implementation, starting from a clean tree. 2026-10-02.
 
-> **Start with [`SESSION-HANDOFF-2026-10-03.md`](SESSION-HANDOFF-2026-10-03.md).**
-> It carries the current state, the first 115k sweep of this arm, the full
-> elimination list, and the corrections to this file (§5 there — several
-> statements below are now known wrong, including the 4.45 reference and
-> "FP4 indexer is not in scope for correctness").
+> **Start with [`SESSION-HANDOFF-2026-10-04.md`](SESSION-HANDOFF-2026-10-04.md).**
+> **Open item A is closed**: two plugin-seam defects (an anchor off-by-one and a
+> metadata stash the target's cudagraph replay left stale) cost 1.4 accepted
+> tokens. Fixed, the ATOM-owned draft holds 3.08–3.19 tok/step at ISL 115k
+> against native's 3.22–3.26, +17–24% throughput, GSM8K lossless. What is left
+> is **item B, DP attention**. That file carries the state, the sweep, the
+> elimination list and the method lessons.
+>
+> [`SESSION-HANDOFF-2026-10-03.md`](SESSION-HANDOFF-2026-10-03.md) is still the
+> reference for the DP attention work (§4 there) and carries the corrections to
+> this file (§5 there — several statements below are known wrong, including the
+> 4.45 reference and "FP4 indexer is not in scope for correctness").
+>
+> **Everything in §3, §6 and the status block of §6 below is superseded.** The
+> ~2.0 acceptance ceiling they describe is fixed; the cudagraph fault they call
+> "Stage 1, fixed" was only half of it.
 
 The previous attempt is described in `SESSION-HANDOFF.md`. It is kept for its
 *measurements*, which are sound, and for its list of dead ends. Its
