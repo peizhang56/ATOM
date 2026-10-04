@@ -120,7 +120,7 @@ confirming it took effect is not an elimination.
 
 ---
 
-## 4. NEW, and separate: a captured TARGET starves the draft's window
+## 4. SECOND DEFECT, found and FIXED: a captured TARGET starved the draft's window
 
 Found while validating the fix in the production config, confirmed pre-existing
 against the parent commit, and now **root-caused**.
@@ -192,36 +192,49 @@ the target's decode capture, which is why it scores 4.11-4.16 and looked like
 | non-restorative `mask_pad_tail` | it restores its prefix as well as marking its tail |
 | aux hidden-state values frozen | aggregate `|mean|`/std identical to the PIECEWISE control -- the statistic does not discriminate, which is why the control was run |
 
-### The fix, not yet made
+### The fix (`dde6b5ba5`)
 
-The stash has to be refilled from a site that runs on **every** step even when
-the target replays. Candidates, cheapest first:
+Re-stash from `AtomDeepseekV4ProxyMetadataBuilder.build`, which runs on every
+step including replays -- which is the whole reason vLLM rebuilds it ("so that
+any attention metadata builder state is updated"). Scoped to the target's proxy
+layer, because the draft's own group builds through here too and its metadata
+describes `[num_reqs x T]` block rows rather than the target's ragged batch.
 
-1. **Refill from the metadata builder.** `build_atom_v4_attention_metadata`
-   runs every step (measured) and already computes everything the draft needs
-   -- `cu_seqlens_q`, `state_slot_out` and `scheduled_bs`. The catch is that it
-   is also called for the DRAFT's own group, so it must be scoped to the
-   target's; the two are distinguishable by their `decode_bufs` identity, which
-   is fragile, so a layer/group tag should be threaded instead.
-2. **Refill from ATOM's existing every-step hook.** `_build_draft_attn_metadata`
-   is already patched (`spec_decode_patch`) precisely because vLLM rebuilds it
-   every step outside the replay. It would have to reach the target's metadata,
-   which `get_deepseek_v4_proxy_metadata_from_vllm_context` may already allow.
-3. **Stop using a stash.** Everything `swa_write` needs is derivable in
-   `precompute_and_store_context_kv` from vLLM's own `input_batch`, which the
-   speculator holds. That is the largest change and the one that removes the
-   whole class of bug.
+Only `scheduled_bs` is step-dependent for this consumer -- `write_context_kv`
+takes its `positions` as an argument, not off the context -- so the paired
+`Context` is carried forward with that one field corrected rather than rebuilt.
+Reconstructing a whole `Context` here would duplicate
+`atom_deepseek_v4_forward_context`'s shape decisions in a second place, and
+those two drifting apart is a worse bug than the one being fixed.
 
-Option 1 or 2, then re-measure: the window freshness audit is the acceptance
-test, and it has no noise floor.
+### Result, production config (`FULL_AND_PIECEWISE`), concurrency 32
+
+| | stash fresh | window fresh | accepted | tok/s |
+|---|---:|---:|---:|---:|
+| before | 0/100 | 69-92% | 1.71 | 1196 |
+| **after** | **100/100** | **99.4%** | **4.01** | **2482** |
+
+The long-run collapse is gone: concurrency 32 at 2048 output tokens holds
+**4.21 / 4.27** where it went `4.19 -> 1.10 -> 1.10 -> 1.10`, finishing in
+22.1s against 45.3s. Concurrency 128: **4.14** accepted, **2560 tok/s**.
+
+**2.08x throughput and 2.3x acceptance, in the configuration the benchmark
+runs.** The window freshness ratio was the acceptance test -- an integer with
+no noise floor.
 
 ## 5. Still open after this
 
-* §4 above — the cudagraph collapse. Blocks any production measurement.
-* GSM8K with the fix (was 0.9413 plugin/ATOM draft vs 0.9507 plugin spec-off).
-* The 115k goal regime with the fix. Do not sweep until §4 is closed: every
-  point would be a blend of two regimes.
-* Item B, DP attention (`SESSION-HANDOFF-2026-10-03.md` §4) — untouched.
+* **The draft's OWN replay safety is untested.** Its cudagraph manager picks
+  `FULL_DECODE_ONLY` whenever the attention backend claims uniform-batch
+  support, and until the stash was fixed the stale window dominated and would
+  have hidden any second defect. Re-check now that the window is clean: the
+  freshness audit runs under a replayed target, so the test exists.
+* GSM8K with both fixes (was 0.9413 for the plugin/ATOM draft against 0.9507
+  plugin spec-off, both measured with the anchor bug AND the stale stash).
+* The 115k goal regime with both fixes. `RESULTS.md` section 1's "speculation is
+  a net LOSS at concurrency 64/128" was measured with both defects present and
+  should be re-run before it is believed.
+* Item B, DP attention (`SESSION-HANDOFF-2026-10-03.md` section 4) -- untouched.
 
 ## 6. Reproduce
 
