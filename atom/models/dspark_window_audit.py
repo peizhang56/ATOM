@@ -78,6 +78,22 @@ _STATE: _AuditState | None = None
 _ENABLED: int | None = None
 
 
+def _capturing() -> bool:
+    """True while a cudagraph capture is open on this stream.
+
+    Both hooks below are eager in the sense that no compiled region traces them,
+    but `speculator.capture()` calls `precompute_and_store_context_kv` with a
+    capture in flight, and `ensure_slots` syncs. A device->host sync inside a
+    capture is an illegal-capture crash, not a slow path -- it took down the
+    whole engine at warm-up the first time. Capture batches are dummies whose
+    results are discarded, so skipping them loses no measurement.
+    """
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:  # noqa: BLE001 - no capture concept on this build
+        return False
+
+
 def audit_interval() -> int:
     """Steps between reports; 0 = disabled. Read once, then cached."""
     global _ENABLED
@@ -195,6 +211,8 @@ def note_writes(
     """
     if not audit_interval():
         return
+    if _capturing():
+        return
     st = _state(window.ring_slots, positions.device)
     maybe_report(st)
 
@@ -233,6 +251,8 @@ def note_reads(
     self-consistent -- which the integer round-trip already showed it is.
     """
     if not audit_interval():
+        return
+    if _capturing():
         return
     st = _state(window.ring_slots, anchors.device)
     B = int(anchors.numel())
@@ -285,6 +305,85 @@ def note_reads(
     detail = torch.where(stale[pick].reshape(-1, 1), detail, torch.full_like(detail, -1))
     st.worst_rows = torch.where(take, detail, st.worst_rows)
     st.worst_ratio = torch.where(take, ratio.reshape(1), st.worst_ratio)
+
+
+def note_alloc_site(what: str) -> None:
+    """Say whether a lazy allocation landed inside an open cudagraph capture.
+
+    Unconditional (not gated on the audit env var): a persistent buffer
+    allocated into a graph's private pool is a correctness bug wherever it
+    happens, and it is silent -- no fault, just indices that point somewhere
+    plausible. One line, once per buffer.
+    """
+    capturing = _capturing()
+    logger.warning(
+        "DSPARK: allocating %s while cudagraph capture is %s.%s",
+        what,
+        "OPEN" if capturing else "closed",
+        " That memory belongs to the graph's pool, not the allocator's."
+        if capturing
+        else "",
+    )
+
+
+_PTR_SEEN: dict = {}
+_BUILD_COUNTS: dict = {}
+
+
+def note_build(tag: str) -> None:
+    """Count metadata builds per buffer set, and report the tally periodically.
+
+    A stable address proves nothing on its own: a captured graph reads the
+    buffer it was given, and if NOTHING refreshes that buffer after capture the
+    replay keeps gathering through a slot table frozen at capture time. That is
+    invisible to a pointer check and exactly what a per-buffer build count
+    exposes -- the target's set ticking up while the draft's sits still.
+    """
+    if not audit_interval():
+        return
+    n = _BUILD_COUNTS.get(tag, 0) + 1
+    _BUILD_COUNTS[tag] = n
+    total = sum(_BUILD_COUNTS.values())
+    if total % 500:
+        return
+    logger.warning(
+        "DSPARK WINDOW AUDIT: metadata builds per buffer set: %s",
+        {k: v for k, v in sorted(_BUILD_COUNTS.items())},
+    )
+
+
+def note_metadata_pointer(tag: str, slots: torch.Tensor, persistent: bool) -> None:
+    """Whether `state_slot_out` keeps ONE address across steps.
+
+    The DSpark draft reads `slots = fc.attn_metadata.state_slot_out[:B]` in
+    Python, inside `dspark_attention`. Under a FULL cudagraph replay that Python
+    never runs, so the captured index kernel keeps whatever address `slots` had
+    at CAPTURE time. That is only correct if the tensor is a stable-address
+    buffer refreshed in place -- `stage()` promises exactly that ("return the
+    from-base GPU view (stable data pointer)"), but only on the
+    `decode_persistent` path. A build that falls to the eager path instead does
+    `torch.from_numpy(...).to(device)`, a fresh allocation every step, and the
+    replay then gathers the draft's window through a dead slot table.
+
+    This reports the first address per tag and every change after it, which is
+    the whole question: one line per tag means stable, a stream means not.
+    """
+    if not audit_interval() or slots is None:
+        return
+    ptr = int(slots.data_ptr())
+    prev = _PTR_SEEN.get(tag)
+    if prev == (ptr, persistent):
+        return
+    _PTR_SEEN[tag] = (ptr, persistent)
+    logger.warning(
+        "DSPARK WINDOW AUDIT: state_slot_out[%s] address %s -> 0x%x "
+        "(persistent=%s). A changing address here is a stale read under FULL "
+        "cudagraph replay.",
+        tag,
+        "0x%x" % prev[0] if prev else "(first)",
+        ptr,
+        persistent,
+    )
 
 
 def maybe_report(st: _AuditState) -> None:
