@@ -326,6 +326,96 @@ def note_alloc_site(what: str) -> None:
     )
 
 
+_REMEMBER_COUNT = [0]
+_PRECOMPUTE_COUNT = [0]
+_LAST_SEEN_REMEMBER = [0]
+_STASH_GAPS: list = []
+
+
+def note_target_stash() -> None:
+    """Count refreshes of the target-metadata stash the draft writes through."""
+    _REMEMBER_COUNT[0] += 1
+
+
+def note_stash_age() -> None:
+    """How many target-stash refreshes happened since the previous draft step.
+
+    One per step is the contract `remember_deepseek_v4_target_metadata`
+    documents ("replaced every target step, and the speculator always runs
+    within the step that set it"). ZERO means the target's forward Python did
+    not run -- a FULL cudagraph replay -- so the draft is about to write its
+    context KV through the spans and ring slots of some EARLIER step.
+    """
+    if not audit_interval():
+        return
+    _PRECOMPUTE_COUNT[0] += 1
+    gap = _REMEMBER_COUNT[0] - _LAST_SEEN_REMEMBER[0]
+    _LAST_SEEN_REMEMBER[0] = _REMEMBER_COUNT[0]
+    _STASH_GAPS.append(gap)
+    if len(_STASH_GAPS) < 100:
+        return
+    gaps = _STASH_GAPS[:]
+    _STASH_GAPS.clear()
+    fresh = sum(1 for g in gaps if g >= 1)
+    logger.warning(
+        "DSPARK WINDOW AUDIT: target-metadata stash over %d draft steps -- "
+        "%d refreshed (%.0f%%), %d STALE. A stale step writes its context KV "
+        "through an earlier step's cu_seqlens_q and ring slots.",
+        len(gaps),
+        fresh,
+        100.0 * fresh / len(gaps),
+        len(gaps) - fresh,
+    )
+
+
+_CTX_STATS: list = []
+
+
+@torch.no_grad()
+def note_context_values(hidden_states: torch.Tensor, positions: torch.Tensor) -> None:
+    """Summarise the target-derived rows about to be written into the window.
+
+    Freshness answers "is the row for the position the draft thinks", which is
+    a question about ADDRESSES. It cannot see a row that is addressed perfectly
+    and holds garbage. That is the remaining way the draft can be handed a dead
+    window, and it is what a captured TARGET would cause: the aux hidden states
+    the draft consumes are produced inside the target's graph, so they have to
+    reach this eager call through a buffer the replay actually refreshes.
+
+    Logged as a running mean/absmax plus the step-to-step change. A value that
+    stops moving between steps is the signature: the replay wrote the capture's
+    activations once and nothing since.
+    """
+    if not audit_interval() or _capturing():
+        return
+    h = hidden_states
+    if h is None or h.numel() == 0:
+        return
+    stat = torch.stack(
+        [h.float().abs().mean(), h.float().abs().amax(), h.float().std()]
+    )
+    _CTX_STATS.append(stat)
+    if len(_CTX_STATS) < 50:
+        return
+    vals = torch.stack(_CTX_STATS).cpu()
+    _CTX_STATS.clear()
+    # How much the summary moves between consecutive steps, relative to its own
+    # size. Near zero means the rows are not changing at all.
+    rel = (vals[1:, 0] - vals[:-1, 0]).abs().mean() / vals[:, 0].abs().mean().clamp(
+        min=1e-9
+    )
+    logger.warning(
+        "DSPARK WINDOW AUDIT: context rows over %d steps -- |mean| %.4f, "
+        "absmax %.4f, std %.4f, step-to-step change %.5f (near 0 = the target's "
+        "activations are not reaching this call).",
+        vals.shape[0],
+        float(vals[:, 0].mean()),
+        float(vals[:, 1].mean()),
+        float(vals[:, 2].mean()),
+        float(rel),
+    )
+
+
 _PTR_SEEN: dict = {}
 _BUILD_COUNTS: dict = {}
 
