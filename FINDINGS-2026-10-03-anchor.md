@@ -120,37 +120,100 @@ confirming it took effect is not an elimination.
 
 ---
 
-## 4. NEW, and separate: cudagraphs collapse long generation to the floor
+## 4. NEW, and separate: a captured TARGET starves the draft's window
 
-Found while validating the fix in the production config. **It is not caused by
-the fix** — the control is the parent commit, same probe, same config.
+Found while validating the fix in the production config, confirmed pre-existing
+against the parent commit, and now **root-caused**.
 
-Concurrency 32, 2048 output tokens, `SpecDecoding metrics` in time order:
+### The defect
 
-| arm | sequence of mean accepted |
+The draft writes its context KV through `get_deepseek_v4_target_metadata()` --
+the target batch's `cu_seqlens_q` spans and per-request `state_slot_out`. That
+stash is filled by `remember_deepseek_v4_target_metadata`, called from
+`atom_deepseek_v4_forward_context`, i.e. **from the target's forward Python**.
+A FULL cudagraph replay of the target does not run it. The helper's own
+docstring states the assumption this breaks:
+
+> "It is replaced every target step, and the speculator always runs within the
+> step that set it, so the drafter never sees a stale one."
+
+Measured, concurrency 32, 512 output tokens, batch pinned with `ignore_eos`:
+
+| target mode | stash refreshed | window freshness | accepted |
+|---|---:|---:|---:|
+| PIECEWISE | **100/100** | 99.4-99.7% | **3.86** |
+| FULL | **0/100** | 69-92% and falling | **1.67** |
+
+So every drafted step under a captured target writes its context rows through
+some earlier step's spans and ring slots. The intended rows are never written
+and the window keeps the previous lap -- the audit's stale rows differ from the
+position wanted by **exact multiples of `ring_slots = 135`** (405, 270, 135),
+which is precisely a ring row that was never rewritten:
+
+```
+anchor=564  wanted 564 found 159   (delta 405 = 3x135)
+            wanted 561 found 291   (delta 270 = 2x135)
+            wanted 559 found 424   (delta 135 = 1x135)
+```
+
+Steady state decays to 1.08 accepted with per-position
+`0.057/0/0/0/0/0/0` -- the exact shape of the window-ablated draft. The replay
+is not degrading the draft; it is removing its context.
+
+### It is the TARGET's capture, not the draft's
+
+Measured both ways with the draft's own cudagraph manager forced to NONE:
+
+| | conc 32 |
 |---|---|
-| eager, **with** fix | 2.83 → 3.56 → 4.18 → 5.32 → 5.48 → 5.42 → 5.39 |
-| cudagraph `FULL_AND_PIECEWISE`, **with** fix | 4.30 → 1.45 → 1.09 → **1.08** |
-| cudagraph, **without** fix (control, `0fe840fbb`) | 2.23 → 2.67 → 1.09 → **1.08** |
+| target FULL + draft **replayed** | 1196 tok/s, 1.71 |
+| target FULL + draft **eager** | 1232 tok/s, 1.67 |
+| target PIECEWISE + draft eager | 544 tok/s, 3.86 |
 
-1.08 is the no-window floor (`RESULTS.md` §3 measures the window-ablated draft
-at 1.05–1.06). So under capture the window stops contributing entirely after a
-few hundred decode steps, on both arms, pre-existing.
+Indistinguishable in the first two. An interim patch forcing the draft eager
+was written on the theory that the draft's replay was at fault; the theory is
+wrong and the patch was removed rather than left in. **Whether the draft's
+block pass is itself replay-safe is now untested** -- the stale stash dominates
+and would hide a second defect.
 
-`kb/p1c` "cudagraphs exonerated" (2.376 vs 2.379) is not contradicted — it was
-measured at short generation, where the collapse has not yet happened. The
-collapse needs a few hundred steps to appear, which no previous probe ran.
+A detail that confused this for a while: there is no capture bucket above
+B=71 (other than 512), so concurrency 128 runs the draft eagerly *and* exceeds
+the target's decode capture, which is why it scores 4.11-4.16 and looked like
+"FULL is fine at large batch".
 
-This is now the arm's largest single defect: it caps the production
-configuration at the floor exactly where the benchmark lives (ISL 115k / OSL
-1k). It plausibly explains the 115k sweep's 1.83–2.74 as a blend of pre- and
-post-collapse steps.
+### Eliminated, all by measurement with `ATOM_DSPARK_WINDOW_AUDIT`
 
-**Not yet diagnosed.** The audit cannot see it — Python inside the draft does
-not run on a graph replay, which is the condition being investigated. Any probe
-for it has to be device-side state, or PIECEWISE rather than FULL.
+| candidate | evidence |
+|---|---|
+| stale `state_slot_out` address | stable, and equal to the address the draft baked at capture |
+| draft metadata not rebuilt | both decode buffer sets build every step (750 vs 746) |
+| `DSparkIndexBuffers` in graph-pool memory | allocated with capture closed (manager warm-up call) |
+| `is_dummy_run` all-zero window baked at capture | `use_fp8` is true at capture; `DRAFT-READS` fires there |
+| non-restorative `mask_pad_tail` | it restores its prefix as well as marking its tail |
+| aux hidden-state values frozen | aggregate `|mean|`/std identical to the PIECEWISE control -- the statistic does not discriminate, which is why the control was run |
 
----
+### The fix, not yet made
+
+The stash has to be refilled from a site that runs on **every** step even when
+the target replays. Candidates, cheapest first:
+
+1. **Refill from the metadata builder.** `build_atom_v4_attention_metadata`
+   runs every step (measured) and already computes everything the draft needs
+   -- `cu_seqlens_q`, `state_slot_out` and `scheduled_bs`. The catch is that it
+   is also called for the DRAFT's own group, so it must be scoped to the
+   target's; the two are distinguishable by their `decode_bufs` identity, which
+   is fragile, so a layer/group tag should be threaded instead.
+2. **Refill from ATOM's existing every-step hook.** `_build_draft_attn_metadata`
+   is already patched (`spec_decode_patch`) precisely because vLLM rebuilds it
+   every step outside the replay. It would have to reach the target's metadata,
+   which `get_deepseek_v4_proxy_metadata_from_vllm_context` may already allow.
+3. **Stop using a stash.** Everything `swa_write` needs is derivable in
+   `precompute_and_store_context_kv` from vLLM's own `input_batch`, which the
+   speculator holds. That is the largest change and the one that removes the
+   whole class of bug.
+
+Option 1 or 2, then re-measure: the window freshness audit is the acceptance
+test, and it has no noise floor.
 
 ## 5. Still open after this
 
