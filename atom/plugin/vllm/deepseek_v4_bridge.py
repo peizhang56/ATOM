@@ -1560,6 +1560,17 @@ def build_atom_v4_attention_metadata(
     md.chunk_start_per_seq_cpu = chunk_start_np
 
     decode_persistent = is_decode and decode_bufs is not None
+    # Tag by the BUFFER identity, not just the path: the target's decode
+    # build and the draft's decode build both land here with their own
+    # persistent buffer set, so one shared tag makes two stable addresses
+    # look like one address flapping every step.
+    _audit_md_tag = (
+        f"decode={is_decode} persistent={decode_persistent} "
+        f"bufs={id(decode_bufs):#x} nreq={num_reqs}"
+    )
+    from atom.models.dspark_window_audit import note_build
+
+    note_build(f"decode={is_decode} bufs={id(decode_bufs):#x}")
     # Real reqs are contiguous at the front of a (reordered) decode batch; CG
     # padding appends zero-query-len reqs at the tail.
     scheduled_bs = int((lens > 0).sum()) if is_decode else num_reqs
@@ -1635,6 +1646,10 @@ def build_atom_v4_attention_metadata(
         # populated by this forward.
         md.state_slot_mapping_cpu = physical_slot_arr
         md.state_slot_mapping = md.state_slot_out
+        # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set.
+        from atom.models.dspark_window_audit import note_metadata_pointer
+
+        note_metadata_pointer(_audit_md_tag, md.state_slot_out, True)
         # Per-token seq map padded to T_pad with the -1 sentinel tail.
         if total:
             bufs.batch_id.np[:total] = batch_np
@@ -1723,6 +1738,11 @@ def build_atom_v4_attention_metadata(
     md.state_slot_out_cpu = physical_slot_arr
     md.state_slot_mapping = md.state_slot_out
     md.state_slot_mapping_cpu = physical_slot_arr
+    # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set. This is the
+    # fresh-allocation path; a draft decode landing here replays stale.
+    from atom.models.dspark_window_audit import note_metadata_pointer
+
+    note_metadata_pointer(_audit_md_tag, md.state_slot_out, False)
     md.batch_id_per_q_token = torch.from_numpy(batch_np).to(device)
     md.n_committed_csa_per_seq = torch.from_numpy(n_csa_cpu).to(device)
     md.compress_plans = _make_compress_plans(

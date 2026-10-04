@@ -857,6 +857,15 @@ class DSparkLayer(Block):  # type: ignore[misc]
             # accessor (lazy); `bufs.views` raises if stage 0 did not fill first.
             bufs = self.index_buffers(T, W, x.device)
             if self.stage_id == 0:
+                # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set. THIS
+                # is the address a FULL cudagraph bakes into the replayed index
+                # kernel, because this Python runs at capture and never again.
+                # It has to match the buffer the per-step metadata build keeps
+                # refreshing, or the draft gathers its window through a slot
+                # table nobody is updating.
+                from atom.models.dspark_window_audit import note_metadata_pointer
+
+                note_metadata_pointer("DRAFT-READS", slots, True)
                 bufs.build(a.swa_window, slots, positions, a.n_local_heads)
                 # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set: how
                 # much of the window `build` just claimed was ever written.
@@ -1310,6 +1319,16 @@ class _DSparkInner(nn.Module):
         `forward`.
         """
         if self._index_bufs is None:
+            # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set. WHERE this
+            # allocation happens decides whether the bundle is ordinary memory
+            # or the cudagraph pool's: a `torch.empty` issued while a capture is
+            # open belongs to that graph's private pool, which other captures
+            # may reuse and which `mask_pad_tail` then writes to from OUTSIDE
+            # any replay. The lazy-alloc note above reasons about Dynamo
+            # tracing, which is a different hazard.
+            from atom.models.dspark_window_audit import note_alloc_site
+
+            note_alloc_site("DSparkIndexBuffers")
             self._index_bufs = DSparkIndexBuffers.allocate(
                 self._max_num_seqs, draft, window, device
             )
