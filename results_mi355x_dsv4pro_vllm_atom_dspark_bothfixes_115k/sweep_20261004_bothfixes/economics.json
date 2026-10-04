@@ -1,0 +1,85 @@
+{
+  "date": "2026-10-04",
+  "model": "/data/DeepSeek-V4-Pro-0813",
+  "catalog_model": "deepseek-v4-pro-0813",
+  "catalog_url": "https://api.digitalocean.com/v2/gen-ai/models/catalog",
+  "pricing_per_token": {
+    "input_price_per_million": 1.32e-06,
+    "output_price_per_million": 3.96e-06,
+    "cache_read_input_price_per_million": 4.4e-08,
+    "input_cache_read": 4.4e-08
+  },
+  "pricing_error": null,
+  "rows": [
+    {
+      "date": "2026-10-04",
+      "concurrency": 16,
+      "in_tps_gpu": 7792.705550238527,
+      "out_tps_gpu": 67.71372855777211,
+      "out_tps_node": 541.7098284621769,
+      "gpus_per_node": 8,
+      "usd_per_gpu_hr": 9.329888518809465,
+      "usd_per_gpu_hr_input": 8.364561604489866,
+      "usd_per_gpu_hr_output": 0.9653269143195994,
+      "cache_hit_frac_billed": 0.8008134130164113,
+      "tps_target": null,
+      "nodes_needed": null
+    },
+    {
+      "date": "2026-10-04",
+      "concurrency": 24,
+      "in_tps_gpu": 12489.279976270804,
+      "out_tps_gpu": 108.52404714680875,
+      "out_tps_node": 868.19237717447,
+      "gpus_per_node": 8,
+      "usd_per_gpu_hr": 9.84809986793615,
+      "usd_per_gpu_hr_input": 8.300981051811245,
+      "usd_per_gpu_hr_output": 1.5471188161249056,
+      "cache_hit_frac_billed": 0.8897926489137297,
+      "tps_target": null,
+      "nodes_needed": null
+    },
+    {
+      "date": "2026-10-04",
+      "concurrency": 32,
+      "in_tps_gpu": 14117.8013898856,
+      "out_tps_gpu": 122.67494449465671,
+      "out_tps_node": 981.3995559572537,
+      "gpus_per_node": 8,
+      "usd_per_gpu_hr": 11.132208463352487,
+      "usd_per_gpu_hr_input": 9.383354454636661,
+      "usd_per_gpu_hr_output": 1.7488540087158262,
+      "cache_hit_frac_billed": 0.8897929710699978,
+      "tps_target": null,
+      "nodes_needed": null
+    },
+    {
+      "date": "2026-10-04",
+      "concurrency": 64,
+      "in_tps_gpu": 16406.31605817093,
+      "out_tps_gpu": 142.56071857217853,
+      "out_tps_node": 1140.4857485774282,
+      "gpus_per_node": 8,
+      "usd_per_gpu_hr": 12.936770874182523,
+      "usd_per_gpu_hr_input": 10.904425270217546,
+      "usd_per_gpu_hr_output": 2.032345603964977,
+      "cache_hit_frac_billed": 0.8897927536144912,
+      "tps_target": null,
+      "nodes_needed": null
+    },
+    {
+      "date": "2026-10-04",
+      "concurrency": 128,
+      "in_tps_gpu": 15787.405068115628,
+      "out_tps_gpu": 137.18277858727782,
+      "out_tps_node": 1097.4622286982226,
+      "gpus_per_node": 8,
+      "usd_per_gpu_hr": 12.44874675794172,
+      "usd_per_gpu_hr_input": 10.493069066401487,
+      "usd_per_gpu_hr_output": 1.9556776915402327,
+      "cache_hit_frac_billed": 0.8897927294527748,
+      "tps_target": null,
+      "nodes_needed": null
+    }
+  ]
+}
