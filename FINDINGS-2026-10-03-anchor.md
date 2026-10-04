@@ -222,21 +222,42 @@ The long-run collapse is gone: concurrency 32 at 2048 output tokens holds
 runs.** The window freshness ratio was the acceptance test -- an integer with
 no noise floor.
 
-## 5. Still open after this
+## 5. Correctness: speculation is now lossless in the plugin
 
-* **The draft's OWN replay safety is untested.** Its cudagraph manager picks
-  `FULL_DECODE_ONLY` whenever the attention backend claims uniform-batch
-  support, and until the stash was fixed the stale window dominated and would
-  have hidden any second defect. Re-check now that the window is clean: the
-  freshness audit runs under a replayed target, so the test exists.
-* GSM8K with both fixes (was 0.9413 for the plugin/ATOM draft against 0.9507
-  plugin spec-off, both measured with the anchor bug AND the stale stash).
-* The 115k goal regime with both fixes. `RESULTS.md` section 1's "speculation is
-  a net LOSS at concurrency 64/128" was measured with both defects present and
-  should be re-run before it is believed.
-* Item B, DP attention (`SESSION-HANDOFF-2026-10-03.md` section 4) -- untouched.
+GSM8K, full 1319, 5-shot, with BOTH fixes
+(`/tmp/dsv4logs/gsm8k_bothfixes`, strict-match):
 
-## 6. Reproduce
+| arm | GSM8K |
+|---|---:|
+| native | 0.9515 |
+| plugin, spec OFF | 0.9507 |
+| **plugin, ATOM draft, both fixes** | **0.9477 ± 0.0061** |
+| plugin, ATOM draft, before | 0.9413 |
+| plugin, vLLM draft | 0.9262 |
+
+0.9477 against the 0.9507 spec-off arm is **0.0030, with a stderr of 0.0061** --
+inside noise, i.e. speculative decoding is lossless here. Before the fixes the
+gap was 0.0094 (~1.5 stderr). flexible-extract came in at 0.9401, close enough
+to strict-match that extraction is sound (the harness's own criterion).
+
+Note this does NOT re-derive the native number on this build; 0.9515 and 0.9507
+are carried from `RESULTS.md` section 6 and were measured on different shas.
+The comparison that matters -- spec-on against spec-off within the plugin --
+still needs its spec-off leg re-run on this build before it is quoted
+externally.
+
+## 6. Still open after this
+
+* **The draft's OWN replay safety is untested.** Until the stash was fixed the
+  stale window dominated and would have hidden a second defect. The freshness
+  audit now runs under a replayed target, so the test exists.
+* The 115k goal regime with both fixes -- running. `RESULTS.md` section 1's
+  "speculation is a net LOSS at concurrency 64/128" was measured with both
+  defects present and should not be believed until it is re-run.
+* Item B, DP attention (`SESSION-HANDOFF-2026-10-03.md` section 4) -- untouched,
+  and still the larger throughput lever.
+
+## 7. Reproduce
 
 ```bash
 # the fix, eager, with the instrument that found it
