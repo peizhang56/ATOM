@@ -863,9 +863,18 @@ class DSparkLayer(Block):  # type: ignore[misc]
                 # It has to match the buffer the per-step metadata build keeps
                 # refreshing, or the draft gathers its window through a slot
                 # table nobody is updating.
-                from atom.models.dspark_window_audit import note_metadata_pointer
+                from atom.models.dspark_window_audit import (
+                    note_build,
+                    note_metadata_pointer,
+                )
 
                 note_metadata_pointer("DRAFT-READS", slots, True)
+                # Counts the steps this Python actually runs. Under a FULL
+                # replay it does not, so comparing this against the metadata
+                # build count says how much of a run was really replayed --
+                # which is the difference between "capture is fine at small
+                # batch" and "small batch never got captured".
+                note_build(f"dspark_attention-python B={B}")
                 bufs.build(a.swa_window, slots, positions)
                 # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set: how
                 # much of the window `build` just claimed was ever written.

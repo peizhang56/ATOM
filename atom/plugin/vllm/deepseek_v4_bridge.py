@@ -2240,6 +2240,10 @@ def remember_deepseek_v4_target_metadata(attn_metadata, context) -> None:
     Thread-local because each TP worker has its own.
     """
     _last_target_step.value = (attn_metadata, context)
+    # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set.
+    from atom.models.dspark_window_audit import note_target_stash
+
+    note_target_stash()
 
 
 def get_deepseek_v4_target_metadata():

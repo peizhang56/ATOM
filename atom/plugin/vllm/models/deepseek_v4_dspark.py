@@ -373,6 +373,15 @@ class DeepseekV4DSparkVllm(ATOMMoEForCausalLM):
         if slot_mappings is None:
             return
 
+        # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set.
+        from atom.models.dspark_window_audit import (
+            note_context_values,
+            note_stash_age,
+        )
+
+        note_stash_age()
+        note_context_values(hidden_states, positions)
+
         from atom.plugin.vllm.deepseek_v4_bridge import (
             bind_deepseek_v4_proxy_cache_views,
             get_deepseek_v4_target_metadata,
