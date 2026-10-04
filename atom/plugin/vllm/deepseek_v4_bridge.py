@@ -666,6 +666,34 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
         reset_slots = getattr(md, "reset_slots", None)
         if reset_slots:
             reset_deepseek_v4_state_slots(model, reset_slots)
+        # Keep the DSpark drafter's view of the target step current even when
+        # the target's forward is a cudagraph REPLAY.
+        #
+        # `write_context_kv` takes the target batch's `cu_seqlens_q` spans and
+        # per-request `state_slot_out` from
+        # `get_deepseek_v4_target_metadata()`, and that stash is otherwise
+        # filled only by `remember_deepseek_v4_target_metadata` inside
+        # `atom_deepseek_v4_forward_context` -- the target's forward Python,
+        # which a FULL replay never runs. Its docstring assumes the opposite
+        # ("replaced every target step ... the drafter never sees a stale one").
+        #
+        # Measured before this, concurrency 32: 0 of 100 drafted steps had a
+        # refreshed stash under a captured target, against 100 of 100 under
+        # PIECEWISE; window freshness 69% against 99.4%, accepted 1.67 against
+        # 3.86. The stale rows differed from the position wanted by exact
+        # multiples of ring_slots, i.e. rows never rewritten on this lap.
+        #
+        # This builder runs on EVERY step, replay included, which is the whole
+        # reason vLLM rebuilds it ("so that any attention metadata builder state
+        # is updated"). Scoped to the TARGET's proxy layer -- the draft's own
+        # group builds through here too, and its block metadata describes
+        # [num_reqs x T] rows, not the target's ragged batch.
+        if (
+            not capturing
+            and proxy_layer_name == ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+            and getattr(md, "state_slot_out", None) is not None
+        ):
+            _refresh_deepseek_v4_target_stash(md, common_attn_metadata)
         common_attn_metadata.atom_v4_md = md
         return common_attn_metadata
 
@@ -2244,6 +2272,37 @@ def remember_deepseek_v4_target_metadata(attn_metadata, context) -> None:
     from atom.models.dspark_window_audit import note_target_stash
 
     note_target_stash()
+
+
+def _refresh_deepseek_v4_target_stash(md, common_attn_metadata) -> None:
+    """Re-stash the target step from the metadata builder, not the forward.
+
+    Only the ``scheduled_bs`` of the paired ``Context`` is step-dependent for
+    this consumer: ``write_context_kv`` reads that to slice ``cu_seqlens_q``
+    and ``state_slot_out``, and takes its ``positions`` as an argument rather
+    than off the context. So the context is carried forward from the last real
+    target forward with that one field corrected, rather than rebuilt here --
+    reconstructing a whole ``Context`` would duplicate
+    ``atom_deepseek_v4_forward_context``'s shape decisions in a second place,
+    and those two drifting apart is a worse bug than the one being fixed.
+
+    No-op until the first eager target forward has run, which is the warm-up /
+    first prefill and therefore always precedes any replayed decode.
+    """
+    import dataclasses
+
+    prev = getattr(_last_target_step, "value", None)
+    if prev is None:
+        return
+    _prev_md, prev_context = prev
+    num_reqs = int(getattr(common_attn_metadata, "num_reqs", 0) or 0)
+    if num_reqs <= 0:
+        return
+    # Through the setter, not the thread-local: it is the one place the stash
+    # is written, and routing around it would also route around its accounting.
+    remember_deepseek_v4_target_metadata(
+        md, dataclasses.replace(prev_context, scheduled_bs=num_reqs)
+    )
 
 
 def get_deepseek_v4_target_metadata():
