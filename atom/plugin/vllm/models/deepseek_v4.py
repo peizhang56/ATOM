@@ -16,6 +16,10 @@ import dataclasses
 
 import torch
 
+from aiter.dist.parallel_state import get_tp_group
+from atom.model_ops.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
 from atom.models import deepseek_v4 as deepseek_v4_base
 
 # isort: off
@@ -90,6 +94,22 @@ class IndexerVllm(IndexerBase):
             return self._score_topk_prefill(
                 q_quant, weights, block_tables, indexer_meta, topk
             )  # [total_tokens, topk] int32
+
+        if num_decode_tokens >= q_quant.size(0):
+            # All rows are decode rows, so the prefill slice is empty and
+            # `_score_topk_prefill` would chunk by a zero step. Reachable when a
+            # step is prefill-classified but carries only decode rows.
+            return self._score_topk_decode(
+                q_quant,
+                weights,
+                block_tables,
+                indexer_meta,
+                topk,
+                next_n=int(indexer_meta["decode_next_n"]),
+                n_committed_per_seq=indexer_meta["n_committed_per_seq_gpu"][
+                    : int(indexer_meta["num_decodes"])
+                ],
+            )
 
         num_decodes = int(indexer_meta["num_decodes"])
         n_committed_per_seq = indexer_meta["n_committed_per_seq_gpu"]
@@ -218,6 +238,14 @@ class IndexerVllm(IndexerBase):
         return topk_local  # [total_tokens, index_topk] int32, raw seq-local
 
 
+def dp_attention_enabled() -> bool:
+    """Plugin-mode DP attention gate. OFF by default; see
+    :meth:`DeepseekV4AttentionVllm.__init__` for what it changes and why."""
+    import os
+
+    return os.environ.get("ATOM_VLLM_DP_ATTENTION") == "1"
+
+
 class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
     """DeepSeek-V4 attention with vLLM piecewise-CUDA-graph reconciliation.
 
@@ -256,6 +284,83 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
     rows are never sampled (``logits_indices`` reference real positions only).
     """
 
+    def __init__(self, *args, **kwargs):
+        """Optionally build this attention REPLICATED rather than TP-sharded.
+
+        DP attention needs every rank to hold all heads so it can own a slice of
+        the REQUESTS instead of a slice of the heads. Native gets there by
+        running the whole model at ``runtime_tp_size = tp // dp = 1`` with MoE
+        flattened into EP; that shape cannot port, because what makes it fast is
+        ATOM's engine keeping one scheduler / KV pool / prefix cache across the
+        DP ranks, and vLLM's ``--data-parallel-size`` gives eight independent
+        engines instead (measured 2.0-4.7x WORSE -- `kb/e1`).
+
+        So the plugin keeps vLLM's single-scheduler TP engine and makes only the
+        ATTENTION replicated, leaving MoE on TP. Under MLA every rank already
+        holds the same latent, so no KV moves: the win is purely that a rank
+        stops reading all eight requests' latents every step.
+
+        Done by patching the symbols ``DeepseekV4Attention.__init__`` reads --
+        the same try/finally idiom ``DeepseekV4DSparkDraft.__init__`` uses to
+        rebind the attention/indexer classes -- so
+        ``atom/models/deepseek_v4.py`` stays untouched (it is
+        ``@support_torch_compile``; see ATOM's CLAUDE.md critical rules).
+
+        Costs +16.5 GiB/rank of weights (2.36 -> 18.87), i.e. ~11% of the KV
+        pool, against 1.95-2.31x of decode step time (`kb/e3`).
+
+        OFF unless ``ATOM_VLLM_DP_ATTENTION=1``. Step 1 is correctness only:
+        every rank still computes every request, so output is unchanged and
+        throughput is not yet better. The request split + all-gather is step 2.
+        """
+        # Target layers only. The DSpark draft's stages are built through this
+        # same class -- `DeepseekV4DSparkDraft.__init__` rebinds
+        # `DeepseekV4Attention` to it -- and they are numbered ABOVE the
+        # target's depth (`DSparkLayer(args.n_layers + i, ...)`). Replicating
+        # them is both pointless (the draft owns a private SWA ring, not the
+        # per-request latent whose re-reading DP attention exists to avoid) and
+        # wrong: their checkpoint scales are TP-sharded, so a replicated weight
+        # meets a shard-sized w_scale and the fused GEMM rejects it
+        # ("w_scale (56, 16) is no ... block of a 7168 x 16384 weight").
+        layer_id = kwargs.get("layer_id", args[0] if args else None)
+        model_args = kwargs.get("args", args[1] if len(args) > 1 else None)
+        n_layers = getattr(model_args, "n_layers", None)
+        is_draft_stage = (
+            layer_id is not None and n_layers is not None and layer_id >= n_layers
+        )
+        if not dp_attention_enabled() or is_draft_stage:
+            super().__init__(*args, **kwargs)
+            return
+
+        base = deepseek_v4_base
+        saved = {
+            n: getattr(base, n)
+            for n in (
+                "get_tensor_model_parallel_world_size",
+                "ColumnParallelLinear",
+                "RowParallelLinear",
+            )
+        }
+
+        def _replicated(cls):
+            class _Rep(cls):
+                def __init__(self, *a, **kw):
+                    kw.setdefault("override_tp_size", 1)
+                    kw.setdefault("override_tp_rank", 0)
+                    super().__init__(*a, **kw)
+
+            _Rep.__name__ = f"Replicated{cls.__name__}"
+            return _Rep
+
+        base.get_tensor_model_parallel_world_size = lambda: 1
+        base.ColumnParallelLinear = _replicated(saved["ColumnParallelLinear"])
+        base.RowParallelLinear = _replicated(saved["RowParallelLinear"])
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            for n, v in saved.items():
+                setattr(base, n, v)
+
     def forward_impl(
         self,
         x: torch.Tensor,
@@ -272,8 +377,62 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                 num_real = bid.shape[0] if bid is not None else num_in
                 if num_real < num_in:
                     out = super().forward_impl(x[:num_real], positions[:num_real])
-                    return torch.nn.functional.pad(out, (0, 0, 0, num_in - num_real))
-        return super().forward_impl(x, positions)
+                    out = torch.nn.functional.pad(out, (0, 0, 0, num_in - num_real))
+                    return self._dp_combine(out)
+        return self._dp_combine(super().forward_impl(x, positions))
+
+    def _dp_owner_mask(self, num_tokens: int, device) -> torch.Tensor | None:
+        """``[num_tokens]`` bool: rows whose REQUEST this rank owns, or None.
+
+        Assignment must be stable for a request's lifetime, or its rolling
+        per-request state would follow a different rank between steps.
+        ``state_slot_out`` is exactly that -- the per-request slot, held from
+        admission to completion -- so ``slot % world_size`` is a stable key that
+        needs no extra bookkeeping and no agreement between ranks beyond the
+        slot they already share.
+        """
+        fc = get_forward_context()
+        if fc.context.is_dummy_run:
+            return None
+        md = fc.attn_metadata
+        bid = getattr(md, "batch_id_per_q_token", None)
+        slots = getattr(md, "state_slot_out", None)
+        if bid is None or slots is None:
+            return None
+        world = get_tp_group().world_size
+        if world <= 1:
+            return None
+        bid = bid[:num_tokens]
+        # Padded rows carry bid < 0 and are owned by nobody; clamp only to keep
+        # the gather in range, then drop them with the same test.
+        owner = torch.where(
+            bid >= 0, slots[bid.clamp(min=0).long()] % world, bid.new_full((), -1)
+        )
+        return owner == get_tp_group().rank_in_group
+
+    def _dp_combine(self, out: torch.Tensor) -> torch.Tensor:
+        """Keep only this rank's rows, then sum across ranks.
+
+        Each row is produced by exactly one rank, so the sum IS the gather.
+        Traffic-neutral rather than additional: with replicated weights ``wo_b``
+        has ``tp_size == 1`` and no longer performs its own all-reduce, so this
+        replaces that collective rather than adding one.
+
+        STEP 2a: every rank still COMPUTES every row and discards the ones it
+        does not own, so this is correctness-only -- it validates the
+        assignment, the mask and the collective. Step 2b makes the kernel skip
+        the KV read for unowned rows, which is where the 1.95x/2.31x is.
+        """
+        if not dp_attention_enabled():
+            return out
+        mask = self._dp_owner_mask(out.size(0), out.device)
+        if mask is None:
+            return out
+        # `where`, not a multiply: once step 2b gives unowned rows empty CSR
+        # ranges their softmax has no keys, so they may come back NaN -- and
+        # NaN * 0 is NaN, which the all-reduce would then spread to every rank.
+        out = torch.where(mask.unsqueeze(-1), out, torch.zeros_like(out))
+        return tensor_model_parallel_all_reduce(out)
 
     def _sparse_attention(
         self,
@@ -376,11 +535,15 @@ class DeepseekV4ModelVllm(DeepseekV4ModelBase):
         )
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        h = super().forward(input_ids, positions)
+        out = super().forward(input_ids, positions)
+        # `(h, aux)` when an EAGLE3/DSpark draft configured aux layers.
+        h, aux_hidden_states = out if isinstance(out, tuple) else (out, None)
         # In-graph copy_: captured into the CUDAGraph so it refreshes the buffer
         # on every replay, keeping the MTP draft's input hidden states current.
         num_tokens = h.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(h.flatten(1))
+        if aux_hidden_states is not None:
+            return h, aux_hidden_states
         return h
 
 

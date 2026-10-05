@@ -32,15 +32,104 @@ def _chunked_prefill_on(scheduler_config) -> bool:
     )
 
 
+def _demote_piecewise_cudagraph(vllm_config) -> None:
+    """Drop the piecewise cudagraph component when there is nothing to split on.
+
+    ``set_splitting_ops_for_v1`` already demotes ``PIECEWISE -> NONE`` and
+    ``FULL_AND_PIECEWISE -> FULL`` on empty ``splitting_ops``, but it
+    early-returns unless ``mode == VLLM_COMPILE`` -- so on a plugin path, where
+    ATOM owns the model and vLLM compiles nothing, the demotion never runs.
+
+    A "piecewise" graph with no splitting ops is the whole model, which vLLM
+    dispatches with ``num_reqs=None``, i.e. any batch under the captured token
+    count is replayable. V4 attention bakes its grids from the captured batch,
+    so replaying an 8-token decode graph for a 6+1 batch faults the GPU.
+
+    ``FULL_DECODE_ONLY`` rather than ``FULL``: V4 prefill is eager, so a full
+    graph over mixed batches is not capturable either.
+    """
+    cc = getattr(vllm_config, "compilation_config", None)
+    if cc is None:
+        return
+    from vllm.config import CompilationMode, CUDAGraphMode
+
+    if getattr(cc, "mode", None) == CompilationMode.VLLM_COMPILE:
+        return  # vLLM compiles the model itself; its own demotion applies.
+    if getattr(cc, "splitting_ops", None):
+        return
+    mode = getattr(cc, "cudagraph_mode", None)
+    if mode is None or not mode.has_piecewise_cudagraphs():
+        return
+    demoted = (
+        CUDAGraphMode.FULL_DECODE_ONLY
+        if mode.has_full_cudagraphs()
+        else CUDAGraphMode.NONE
+    )
+    cc.cudagraph_mode = demoted
+    logger.warning(
+        "ATOM DeepSeek-V4: cudagraph_mode %s requests piecewise cudagraphs, but "
+        "the model is ATOM-owned so vLLM compiles nothing and splitting_ops is "
+        "empty -- a 'piecewise' graph would be the whole model, replayed for "
+        "batches whose query-length structure differs from capture. Demoting to "
+        "%s; pass `-O.cudagraph_mode=%s` to select it explicitly.",
+        mode.name,
+        demoted.name,
+        demoted.name,
+    )
+
+
+def _note_missing_dp_attention(vllm_config) -> None:
+    """Say once that this path has no DP attention, and what it costs.
+
+    MLA keeps ONE latent per token, shared by every head, so tensor parallelism
+    does not shard the KV read: each of the TP ranks reads the whole
+    per-request cache every step (~662 MB at 115k context on V4-Pro, counting
+    the sparse-index plane). ATOM native answers that with
+    ``--enable-dp-attention``, which gives each rank all the heads and 1/N of
+    the requests. Plugin mode cannot: ``_generate_atom_config_from_vllm_config``
+    hardcodes ``enable_dp_attention=False`` because the feature is a rank-layout
+    decision in ATOM's own engine, and plugin mode runs vLLM's ``GPUModelRunner``
+    instead.
+
+    Measured on MI355X, DeepSeek-V4-Pro-0813 TP8, ISL 115k / OSL 1k, DSpark 7:
+    removing ``--enable-dp-attention`` from the native arm raises its decode
+    step time **1.95x at concurrency 64 and 2.31x at 128** and lands it within
+    5% of this path's -- at 128 this path is 4% faster. The plugin's decode is
+    at parity; the whole gap is that one feature. (``--enable-tbo`` was
+    measured separately at 0.96x / 0.92x, i.e. a net loss, so it is not part of
+    this.) The cost scales with context length and concurrency and is near zero
+    on short-context serving -- which is why ATOM's own out-of-tree benchmark
+    for this model (1024x1024, 8192x1024) never saw it.
+
+    ``info``, not a warning: nothing here is misconfigured and there is no
+    action to take yet. It exists so the next long-context measurement starts
+    from the explanation rather than rediscovering it.
+    """
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    world = getattr(parallel_config, "tensor_parallel_size", 1) or 1
+    if world <= 1:
+        return  # Single rank reads its own cache once; nothing is replicated.
+    logger.info(
+        "ATOM DeepSeek-V4: no DP attention on the vLLM plugin path, so each of "
+        "the %d TP ranks reads every request's full MLA latent and index plane "
+        "each decode step. Native's --enable-dp-attention is worth 1.95x "
+        "(concurrency 64) to 2.31x (128) of decode step time at ISL 115k; the "
+        "cost falls to ~0 at short context. Not a misconfiguration -- the "
+        "feature lives in ATOM's engine, which plugin mode replaces with "
+        "vLLM's model runner.",
+        world,
+    )
+
+
 def _enforce_deepseek_v4_constraints(vllm_config) -> None:
     """Apply V4-specific plugin constraints.
 
-    1. Enable prefix caching via SWA recompute: V4's per-request SWA
+    1. Enable prefix caching via tail recompute: V4's per-request SWA
        sliding-window ring is not carried by vLLM's block-level prefix cache
        (only the CSA/HCA compressed pages are). Rather than disable caching, we
-       install a KVCacheManager patch that, on a prefix hit, drops the last
-       ``ceil(win_with_spec / block_size)`` cached blocks so the SWA tail is
-       re-forwarded and the ring is repopulated (mirrors native ATOM "fix B'").
+       install a KVCacheManager patch that rolls every prefix hit back by
+       ``max(win_with_spec, index_topk)`` tokens so the tail is re-forwarded and
+       the ring is repopulated (mirrors native ATOM "fix B'").
        See ``deepseek_v4_prefix_patch``.
 
     2. Guard the non-chunked oversized forward: with chunked prefill off, vLLM
@@ -49,20 +138,34 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
        offsets in per-token kernels. Fail fast with an actionable error instead
        of crashing with "illegal memory access". Enable chunked prefill for long
        context.
+
+    3. Demote piecewise cudagraph modes, a demotion vLLM skips on a plugin path.
+       See ``_demote_piecewise_cudagraph``.
     """
     mc = getattr(vllm_config, "model_config", None)
     if mc is None or not _is_deepseek_v4(mc):
         return
+
+    _note_missing_dp_attention(vllm_config)
+    _demote_piecewise_cudagraph(vllm_config)
 
     cache_config = getattr(vllm_config, "cache_config", None)
     if cache_config is not None and getattr(
         cache_config, "enable_prefix_caching", False
     ):
         from atom.plugin.vllm.deepseek_v4_prefix_patch import (
-            apply_vllm_v4_prefix_swa_patch,
+            apply_vllm_v4_prefix_recompute_patch,
         )
 
-        apply_vllm_v4_prefix_swa_patch(vllm_config)
+        apply_vllm_v4_prefix_recompute_patch(vllm_config)
+
+    # Unconditional: vLLM's cudagraph memory profiling allocates one block per
+    # sequence, fewer than the V4 proxy page amortizes over.
+    from atom.plugin.vllm.deepseek_v4_profiling_patch import (
+        apply_vllm_v4_profiling_min_blocks_patch,
+    )
+
+    apply_vllm_v4_profiling_min_blocks_patch(vllm_config)
 
     sc = getattr(vllm_config, "scheduler_config", None)
     if sc is None or _chunked_prefill_on(sc):
@@ -146,3 +249,45 @@ if not disable_vllm_plugin:
 
 else:
     ATOMPlatform = None
+
+
+def install_platform_config_hook() -> None:
+    """Run ATOMPlatform's config hook even when the platform plugin lost the race.
+
+    vLLM memoizes `current_platform` on first read. On 0.25.x that read happens
+    during `import vllm` itself (`env_override` -> `utils.torch_utils`, whose
+    module body runs `is_pin_memory_available()`), while `vllm.model_executor`
+    is half-imported: `register_platform()` dies on a circular ImportError,
+    vLLM swallows it and caches the builtin platform. Later resolutions log
+    "Platform plugin atom is activated" but nothing re-reads
+    `_current_platform`, so `check_and_update_config` never runs.
+
+    For DeepSeek-V4 the casualty is `_enforce_deepseek_v4_constraints`: without
+    the prefix-cache SWA-recompute patch a cross-request hit reads an empty SWA
+    ring and the model emits another request's content. That hook is
+    ATOMPlatform's only override, so re-attach just it to whichever platform
+    went live. Called from `register_model()`, which runs inside
+    `create_engine_config()` before the platform hook. Idempotent.
+    """
+    if disable_vllm_plugin:
+        return
+    from vllm.platforms import current_platform
+
+    live_cls = type(current_platform)
+    if ATOMPlatform is not None and issubclass(live_cls, ATOMPlatform):
+        return  # plugin won the race; the hook is already in the MRO
+    original = live_cls.check_and_update_config
+    if getattr(original, "_atom_config_hook_installed", False):
+        return
+
+    def patched(cls, vllm_config) -> None:
+        original(vllm_config)
+        _enforce_deepseek_v4_constraints(vllm_config)
+
+    patched._atom_config_hook_installed = True
+    live_cls.check_and_update_config = classmethod(patched)
+    logger.info(
+        "ATOM plugin: re-attached check_and_update_config to the live platform "
+        "%s (the platform plugin lost vLLM's memoized current_platform race).",
+        live_cls.__name__,
+    )

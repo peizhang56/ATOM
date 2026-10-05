@@ -71,8 +71,21 @@ _DEEPSEEK_V4_ARCHES: set[str] = {
     _DEEPSEEK_V4_ARCH,
     "DeepSeekV4MTPModel",
     "DeepseekV4MTPModel",
+    # The DSpark block drafter is a V4 draft like the MTP ones: it needs the
+    # same proxy-layer registration and ATOM forward context, and it owns its
+    # own rolling KV rather than using vLLM's paged draft pool. See
+    # `models/deepseek_v4_dspark.py`.
+    "DSparkDraftModel",
 }
-_DEEPSEEK_V4_MTP_ARCHES: set[str] = _DEEPSEEK_V4_ARCHES - {_DEEPSEEK_V4_ARCH}
+# Every V4 arch that is a DRAFT rather than the target. These get the draft
+# proxy layer (`deepseek_v4_draft_proxy_layer_name`) instead of the target's.
+_DEEPSEEK_V4_DRAFT_ARCHES: set[str] = _DEEPSEEK_V4_ARCHES - {_DEEPSEEK_V4_ARCH}
+# ...and of those, the ones that take the MTP forward contract, which needs the
+# target's hidden states threaded in. The DSpark block drafter does NOT: vLLM's
+# speculator hands it a laid-out block and it takes the plain
+# `(input_ids, positions)` forward, so it must not be routed through
+# `_deepseek_v4_mtp_forward_kwargs`.
+_DEEPSEEK_V4_MTP_ARCHES: set[str] = _DEEPSEEK_V4_DRAFT_ARCHES - {"DSparkDraftModel"}
 
 
 def _probe_v4_routed_expert_dtype(model_path) -> str | None:
@@ -149,6 +162,9 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
     "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
+    "DSparkDraftModel": (
+        "atom.plugin.vllm.models.deepseek_v4_dspark:DeepseekV4DSparkDraft"
+    ),
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
     "Qwen3NextMTP": "atom.models.qwen3_next_mtp:Qwen3NextMTP",
@@ -169,7 +185,11 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
 
 # DSpark drafts ship as their own checkpoint, so like EAGLE3 they are built from
 # the draft's hf_config and their layers are numbered past the target's.
-_DSPARK_DRAFT_ARCHS: frozenset[str] = frozenset({"K3DSparkModel"})
+# Architectures that are a DSpark DRAFT rather than a DSpark target. Without an
+# entry here the wrapper takes the target branch and tries to expose the EAGLE3
+# aux-hidden-state surface on a draft, which has none -- see
+# `_enable_eagle3_target_interface`.
+_DSPARK_DRAFT_ARCHS: frozenset[str] = frozenset({"K3DSparkModel", "DSparkDraftModel"})
 
 
 def _normalize_atom_model_arch(model_arch: str) -> str:
@@ -541,7 +561,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self._enable_eagle3_target_interface()
         if self.is_mtp:
             self.get_mtp_target_hidden_states = self._get_mtp_target_hidden_states
-        if self.is_mtp or self.is_eagle3:
+        if self.is_mtp or self.is_eagle3 or self.is_dspark:
             # Mirror nested attributes required by vLLM speculative decoding.
             self._expose_spec_decode_attrs()
 
@@ -567,6 +587,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # (see `forward`). Other ATOM models follow vLLM's contract directly.
         self._is_deepseek_v4 = self.model_arch in _DEEPSEEK_V4_ARCHES
         self._is_deepseek_v4_mtp = self.model_arch in _DEEPSEEK_V4_MTP_ARCHES
+        # Distinct from the above: every V4 draft needs the DRAFT proxy layer,
+        # but only the MTP ones take the MTP forward contract.
+        self._is_deepseek_v4_draft = self.model_arch in _DEEPSEEK_V4_DRAFT_ARCHES
         if self._is_deepseek_v4:
             from atom.plugin.vllm.deepseek_v4_bridge import (
                 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
@@ -576,7 +599,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
             self._deepseek_v4_proxy_layer_name = (
                 deepseek_v4_draft_proxy_layer_name(self.atom_config.hf_config)
-                if self._is_deepseek_v4_mtp
+                if self._is_deepseek_v4_draft
                 else ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
             )
             register_deepseek_v4_proxy_layer(
@@ -653,6 +676,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if inner is not None:
             if not hasattr(model, "embedding") and hasattr(inner, "embed"):
                 put(model, "embedding", inner.embed)
+            # DSpark's draft loader aliases the target embedding under
+            # `embed_tokens` only. Without this name the alias silently no-ops
+            # and the draft runs off its own all-zero table
+            # (`has_own_embed_tokens = False`, so the checkpoint never fills it).
+            if not hasattr(model, "embed_tokens") and hasattr(inner, "embed"):
+                put(model, "embed_tokens", inner.embed)
             if not hasattr(model, "lm_head") and hasattr(inner, "head"):
                 put(model, "lm_head", inner.head)
 
@@ -1006,7 +1035,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     )
                 else:
                     hidden_states = self.model(input_ids=input_ids, positions=positions)
-                    self._mtp_target_hidden_states = hidden_states
+                    if isinstance(hidden_states, tuple):
+                        # EAGLE3/DSpark/DFlash return `(hidden, aux_list)`; vLLM
+                        # unpacks it itself, but the MTP cache wants only hidden.
+                        self._mtp_target_hidden_states = hidden_states[0]
+                    else:
+                        self._mtp_target_hidden_states = hidden_states
         else:
             if (
                 self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}
@@ -1043,6 +1077,22 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         from atom.model_loader.loader import load_model_in_plugin_mode
 
         is_mtp_draft_model = self.model_arch in _MTP_DRAFT_MODEL_ARCHES
+        # Does this draft read its weights out of the checkpoint's `mtp.*`
+        # namespace? `WeightNames.resolve` DROPS every name containing `mtp`
+        # unless `spec_decode` is set, and only then applies the model's
+        # `remap_mtp_weight_name` (weight_names.py:169,177). DeepSeek-V4's
+        # DSpark drafter ships inside the TARGET checkpoint under `mtp.*` like
+        # the MTP drafts do, so without this all 97 of its parameters stay at
+        # their init values -- it drafts from noise, the target rejects every
+        # token, and the only symptom is acceptance pinned at 0 %.
+        #
+        # Keyed on the method rather than an arch list so a new drafter opts in
+        # by declaring the remap it needs anyway. Kimi-K3's DSpark draft does
+        # not declare one (its parameter names match its checkpoint 1:1) and is
+        # unaffected.
+        reads_mtp_namespace = is_mtp_draft_model or callable(
+            getattr(self.model, "remap_mtp_weight_name", None)
+        )
         draft_hf_config = None
         draft_model_path = None
         if is_mtp_draft_model:
@@ -1074,7 +1124,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             model=self.model,
             config=self.atom_config,
             prefix="model.",
-            spec_decode=is_mtp_draft_model,
+            spec_decode=reads_mtp_namespace,
             hf_config_override=draft_hf_config,
             model_name_or_path_override=draft_model_path,
         )

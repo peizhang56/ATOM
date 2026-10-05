@@ -1,6 +1,8 @@
 import functools
 import logging
 
+import torch
+
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -131,6 +133,104 @@ def _patch_dspark_fused_markov_sample() -> None:
     )
 
 
+def _patch_dspark_markov_embed_bounds() -> None:
+    """Bounds-check the DSpark Markov embedding gather.
+
+    ``markov_embed`` is an unguarded ``F.embedding``, and under async scheduling
+    the ids can carry the scheduler's ``-1`` spec placeholder, which reads off
+    the table and faults the GPU.
+
+    Clamped at the point of use, not at the seed: ``_sample_sequential``
+    reassigns ``prev`` on every one of the K steps. No accuracy cost -- the
+    target verifies every draft token, so a bad draft costs acceptance only.
+
+    "Acceptance only" is exactly why the clamp is worth counting. A clamp that
+    fires neither faults nor corrupts; it drafts a wrong token, which is
+    indistinguishable from a drafter that is simply doing badly. Set
+    ``ATOM_DSPARK_CHECK_MARKOV_BOUNDS=1`` to make it say so. Off by default --
+    the check is a device reduction plus a host read per drafting step, i.e. a
+    sync on the decode critical path.
+    """
+    try:
+        from vllm.models.deepseek_v4.amd.dspark import DSparkDeepseekV4ForCausalLM
+    except ImportError:
+        return
+
+    original_markov_embed = DSparkDeepseekV4ForCausalLM.markov_embed
+    if getattr(original_markov_embed, "_atom_markov_bounds_patched", False):
+        return
+
+    check_bounds = envs.ATOM_DSPARK_CHECK_MARKOV_BOUNDS
+
+    @functools.wraps(original_markov_embed)
+    def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        limit = getattr(self, "_atom_markov_num_rows", None)
+        if limit is None:
+            limit = self.model.markov_head.markov_w1.num_embeddings
+            self._atom_markov_num_rows = limit
+        if check_bounds:
+            _count_markov_out_of_range(self, token_ids, limit)
+        # Out-of-place: `prev` is the caller's live loop variable.
+        return original_markov_embed(self, token_ids.clamp(0, limit - 1))
+
+    markov_embed._atom_markov_bounds_patched = True
+    DSparkDeepseekV4ForCausalLM.markov_embed = markov_embed
+    logger.info(
+        "ATOM plugin: bounds-checking the DSpark Markov embedding gather "
+        "(an out-of-range draft id would fault the GPU under async scheduling)%s.",
+        "; counting clamps (ATOM_DSPARK_CHECK_MARKOV_BOUNDS)" if check_bounds else "",
+    )
+
+
+def _count_markov_out_of_range(model, token_ids: torch.Tensor, limit: int) -> None:
+    """Tally clamped ids in a device counter, and log it when it is safe to read.
+
+    The accumulate has to be capture-safe and the read must not be. DSpark's
+    draft decode runs inside a FULL_DECODE_ONLY cudagraph, where a ``.item()``
+    is ``hipErrorStreamCaptureUnsupported`` -- and, worse, a Python-side check
+    would never run at all on replay, which is exactly the steps this is here
+    to watch. So the `+=` is an ordinary device op that gets *captured* and
+    re-executed on every replay, and the host read happens on whatever eager
+    step comes next (this workload interleaves chunked prefill constantly).
+
+    Logged on a power-of-two schedule of non-empty reads: a defect that fires at
+    all fires often, so the first reports arrive immediately and the rate then
+    stops flooding. The counter is per process; with TP every rank has its own.
+    """
+    counter = getattr(model, "_atom_markov_oor", None)
+    if counter is None:
+        if torch.cuda.is_current_stream_capturing():
+            # Allocating during capture is as illegal as reading. Warmup runs
+            # eagerly first, so this is a cold-start corner, not the steady state.
+            return
+        counter = torch.zeros((), dtype=torch.int64, device=token_ids.device)
+        model._atom_markov_oor = counter
+
+    # Captured on replay along with everything else in the draft graph.
+    counter += ((token_ids < 0) | (token_ids >= limit)).sum()
+
+    if torch.cuda.is_current_stream_capturing():
+        return
+    total = int(counter.item())
+    if total == getattr(model, "_atom_markov_oor_reported", 0):
+        return  # nothing new since the last read
+    reads = getattr(model, "_atom_markov_oor_reads", 0) + 1
+    model._atom_markov_oor_reads = reads
+    model._atom_markov_oor_reported = total
+    if reads & (reads - 1):  # not a power of two
+        return
+    logger.warning(
+        "ATOM plugin: DSpark Markov embedding has clamped %d id(s) so far "
+        "(%d read(s) saw new ones; %d id(s) in this call). Every clamped id "
+        "drafts a WRONG token, which costs acceptance silently -- it is not a "
+        "fault and not a wrong answer. Valid ids are [0, %d).",
+        total,
+        reads,
+        token_ids.numel(),
+        limit,
+    )
+
+
 def _get_attn_backend_block_size(backend) -> int:
     supported = backend.get_supported_kernel_block_sizes()
     get_preferred = getattr(backend, "get_preferred_block_size", None)
@@ -167,6 +267,97 @@ def _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec) -> bool:
         elif isinstance(spec, AttentionSpec):
             has_non_mla_attn = True
     return has_mla and has_non_mla_attn
+
+
+def _spec_is_v4_proxy_target_with_mla_draft(kv_cache_spec) -> bool:
+    """The DeepSeek-V4 topology, the mirror image of the EAGLE3 one above: the
+    *target* is ATOM's opaque proxy layer (a FullAttentionSpec of uint8 bytes,
+    with the real MLA + indexer caches behind it) and the *draft* is vLLM's
+    DSpark head, whose 3 `mtp.*` layers are genuine sliding-window MLA.
+
+    `_spec_has_heterogeneous_mla_mha_backend` also matches, but its splitter
+    would rewrite the proxy's block size to ATOM's MHA one and the draft's to
+    ATOM's MLA one -- both wrong, since neither layer belongs to the backend the
+    name suggests. Handle it separately and keep every spec's own block size.
+    """
+    try:
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+
+        from atom.plugin.vllm.deepseek_v4_bridge import (
+            ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+        )
+    except ImportError:  # specs are optional across vLLM versions
+        return False
+
+    if ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME not in kv_cache_spec:
+        return False
+    draft = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if name != ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    }
+    # NB: SlidingWindowMLASpec derives from SlidingWindowSpec, NOT from
+    # MLAAttentionSpec. DSpark's mtp layers produce the former.
+    return bool(draft) and all(
+        isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+        for spec in draft.values()
+    )
+
+
+def _groups_are_v4_proxy_plus_mla_draft(kv_cache_groups) -> bool:
+    """Recognise the pair built by `_build_v4_proxy_draft_kv_cache_groups` so the
+    shared-num_blocks allocator below covers it too. Keyed on the proxy layer
+    name, not spec classes: SlidingWindowMLASpec does not subclass
+    MLAAttentionSpec, so `_groups_are_heterogeneous_mla_mha` misses it.
+    """
+    try:
+        from atom.plugin.vllm.deepseek_v4_bridge import (
+            ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+        )
+    except ImportError:
+        return False
+
+    if len(kv_cache_groups) != 2:
+        return False
+    return kv_cache_groups[0].layer_names == [ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME]
+
+
+def _build_v4_proxy_draft_kv_cache_groups(kv_cache_spec):
+    """Two pools, each keeping the block size its own backend asked for: ATOM's
+    proxy at ATOM_DEEPSEEK_V4_BLOCK_SIZE, the DSpark draft at whatever vLLM's MLA
+    backend picked. Unifying them would rewrite the proxy's block size, which its
+    page -- a byte blob sized for ATOM's internal caches -- cannot survive.
+    """
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec, UniformTypeKVCacheSpecs
+
+    from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    from atom.plugin.vllm.dspark_draft_kv_patch import convert_draft_specs
+
+    proxy_name = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    draft_specs = {
+        name: spec for name, spec in kv_cache_spec.items() if name != proxy_name
+    }
+    # Route the draft's specs to a manager that abstains from the prefix cache;
+    # otherwise the draft group caps the target's hit. See dspark_draft_kv_patch.
+    # No-op for non-DSpark drafts.
+    draft_specs = convert_draft_specs(draft_specs)
+
+    proxy_group = KVCacheGroupSpec(
+        layer_names=[proxy_name],
+        kv_cache_spec=kv_cache_spec[proxy_name],
+    )
+    draft_uniform = UniformTypeKVCacheSpecs.from_specs(draft_specs)
+    assert draft_uniform is not None, (
+        "DSpark draft KV specs are not of a uniform type: "
+        f"{ {n: type(s).__name__ for n, s in draft_specs.items()} }"
+    )
+    draft_group = KVCacheGroupSpec(
+        layer_names=list(draft_specs.keys()),
+        kv_cache_spec=draft_uniform,
+    )
+    # proxy (non-MLA) first, draft (MLA) second; the shared allocator below
+    # accepts either order.
+    return [proxy_group, draft_group]
 
 
 def _split_mla_and_mha_layers(kv_cache_spec):
@@ -360,6 +551,16 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
 
     @functools.wraps(orig_get_groups)
     def patched_get_kv_cache_groups(vllm_config, kv_cache_spec):
+        logger.info(
+            "ATOM plugin: KV cache specs %s",
+            {name: type(spec).__name__ for name, spec in kv_cache_spec.items()},
+        )
+        if _spec_is_v4_proxy_target_with_mla_draft(kv_cache_spec):
+            logger.info(
+                "ATOM plugin: using heterogeneous KV cache layout - ATOM V4 proxy "
+                "target and vLLM MLA draft - with separate per-group pools."
+            )
+            return _build_v4_proxy_draft_kv_cache_groups(kv_cache_spec)
         if getattr(
             vllm_config.model_config, "use_mla", False
         ) and _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec):
@@ -374,7 +575,9 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
     def patched_get_kv_cache_config_from_groups(
         vllm_config, kv_cache_groups, available_memory
     ):
-        if _groups_are_heterogeneous_mla_mha(kv_cache_groups):
+        if _groups_are_heterogeneous_mla_mha(
+            kv_cache_groups
+        ) or _groups_are_v4_proxy_plus_mla_draft(kv_cache_groups):
             return _build_heterogeneous_kv_cache_config_from_groups(
                 vllm_config, kv_cache_groups, available_memory
             )
@@ -382,7 +585,9 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
 
     @functools.wraps(orig_max_mem)
     def patched_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups):
-        if _groups_are_heterogeneous_mla_mha(kv_cache_groups):
+        if _groups_are_heterogeneous_mla_mha(
+            kv_cache_groups
+        ) or _groups_are_v4_proxy_plus_mla_draft(kv_cache_groups):
             return _heterogeneous_max_memory_usage_bytes(vllm_config, kv_cache_groups)
         return orig_max_mem(vllm_config, kv_cache_groups)
 
@@ -412,6 +617,42 @@ def _share_atom_draft_with_target(draft_wrapper, target_model) -> None:
         "%s.share_with_target().",
         draft_base.__class__.__name__,
     )
+
+
+def _patch_dspark_draft_sharing() -> None:
+    """Share the target's embed/head with an ATOM-owned DSpark draft.
+
+    ``_patch_vllm_llm_base_model_sharing`` below hooks
+    ``SpecDecodeBaseProposer.load_model``, which DSpark never reaches: its
+    speculator is ``DSparkSpeculator`` and it loads through
+    ``load_draft_model`` -> ``load_dspark_model``. Without this an ATOM DSpark
+    draft starts with ``embed``/``head`` unset and the first block forward dies
+    on ``'NoneType' object is not callable`` inside the compiled region.
+
+    Hooked on the speculator method rather than ``load_dspark_model`` itself
+    because the speculator imports that symbol by name
+    (``from ...dspark.utils import load_dspark_model``), so rebinding it in its
+    defining module would not be seen.
+
+    A no-op for vLLM's own draft, which has no ``share_with_target``.
+    """
+    try:
+        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+    except ImportError:
+        return
+
+    original = DSparkSpeculator.load_draft_model
+    if getattr(original, "_atom_dspark_share_patched", False):
+        return
+
+    @functools.wraps(original)
+    def load_draft_model(self, target_model, *args, **kwargs):
+        draft = original(self, target_model, *args, **kwargs)
+        _share_atom_draft_with_target(draft, target_model)
+        return draft
+
+    load_draft_model._atom_dspark_share_patched = True
+    DSparkSpeculator.load_draft_model = load_draft_model
 
 
 def _patch_vllm_llm_base_model_sharing() -> None:
@@ -448,7 +689,7 @@ def _patch_vllm_llm_base_model_sharing() -> None:
                     "DeepSeek-V4 MTP draft attention type check."
                 )
 
-    setattr(wrapped_load_model, "_atom_share_with_target_patched", True)
+    wrapped_load_model._atom_share_with_target_patched = True
     SpecDecodeBaseProposer.load_model = wrapped_load_model
 
 
@@ -517,16 +758,8 @@ def _patch_vllm_draft_kv_group_validation() -> None:
             return
         return original_initialize(self, kv_cache_config, kernel_block_sizes)
 
-    setattr(
-        wrapped_validate_same_kv_cache_group,
-        "_atom_kv_group_validation_patched",
-        True,
-    )
-    setattr(
-        wrapped_initialize_attn_backend,
-        "_atom_kv_group_validation_patched",
-        True,
-    )
+    wrapped_validate_same_kv_cache_group._atom_kv_group_validation_patched = True
+    wrapped_initialize_attn_backend._atom_kv_group_validation_patched = True
     SpecDecodeBaseProposer.validate_same_kv_cache_group = (
         wrapped_validate_same_kv_cache_group
     )
@@ -572,9 +805,7 @@ def _patch_vllm_draft_positions_on_metadata() -> None:
             common_attn_metadata.positions = self._get_positions(num_tokens)
         return original_build(self, common_attn_metadata, draft_index)
 
-    setattr(
-        wrapped_build_per_group_and_layer_attn_metadata, "_atom_positions_patched", True
-    )
+    wrapped_build_per_group_and_layer_attn_metadata._atom_positions_patched = True
     SpecDecodeBaseProposer.build_per_group_and_layer_attn_metadata = (
         wrapped_build_per_group_and_layer_attn_metadata
     )
@@ -623,7 +854,7 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
             num_rejected_tokens_gpu,
         )
 
-    setattr(wrapped_set_inputs_first_pass, "_atom_v4_mtp_inputs_patched", True)
+    wrapped_set_inputs_first_pass._atom_v4_mtp_inputs_patched = True
     SpecDecodeBaseProposer.set_inputs_first_pass = wrapped_set_inputs_first_pass
 
 
@@ -636,11 +867,90 @@ def _patch_vllm_dspark_dcp_inputs() -> None:
     apply_vllm_dspark_dcp_input_patch()
 
 
+def _patch_dspark_draft_block_padding() -> None:
+    """Give the ATOM DSpark draft a step-wise hook outside the graph replay.
+
+    vLLM pads the draft batch to a cudagraph bucket
+    (``dispatch_cg_and_sync_dp``) and hands the model the PADDED token count, so
+    ATOM's request-parallel block runs ``num_reqs_padded`` blocks while only
+    ``num_reqs`` are real. vLLM's own drafts do not care -- they are
+    token-parallel, every row independent -- but ATOM's rebuilds each block from
+    an anchor and indexes per-request ring slots, and the fabricated rows
+    inherit slot 0, a live request's. Left alone they scatter draft KV into it.
+
+    The hook has to run every step and OUTSIDE the graph, because the FULL path
+    is ``query_cudagraph_manager.run_fullgraph(batch_desc)`` -- a pure replay
+    that runs none of ``_generate_draft``'s Python.
+    ``_build_draft_attn_metadata`` is the one call that satisfies both: vLLM
+    rebuilds it on every step by design ("even when replaying the FULL graph so
+    that any attention metadata builder state is updated"), it is outside the
+    replay, and it is handed both counts.
+
+    Scoped by ``prepare_draft_block`` being present, so this is a no-op for
+    vLLM's own DSpark draft and for every other speculator.
+    """
+    try:
+        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+    except ImportError:
+        return
+
+    original = DSparkSpeculator._build_draft_attn_metadata
+    if getattr(original, "_atom_dspark_block_padding_patched", False):
+        return
+
+    @functools.wraps(original)
+    def wrapped_build_draft_attn_metadata(
+        self, num_reqs, num_reqs_padded, num_tokens_padded, *args, **kwargs
+    ):
+        prepare = getattr(getattr(self, "model", None), "prepare_draft_block", None)
+        if prepare is None:
+            return original(
+                self, num_reqs, num_reqs_padded, num_tokens_padded, *args, **kwargs
+            )
+
+        # The padding that reaches the model is the TOKEN count, not the request
+        # count: upstream spells them
+        #
+        #     num_reqs_padded   = batch_desc.num_reqs or num_reqs   # often None
+        #     num_tokens_padded = batch_desc.num_tokens             # the padded one
+        #
+        # and then runs the draft over `num_tokens_padded`. A token-parallel
+        # draft does not notice. ATOM's block is request-parallel, so it runs
+        # `num_tokens_padded // T` BLOCKS -- which can exceed `num_reqs` even
+        # when `num_reqs_padded == num_reqs`.
+        block_bs = num_tokens_padded // max(1, int(self.num_query_per_req))
+
+        # Publish the per-request tables at the width the block actually runs.
+        # Native states the failure this prevents exactly: "a Python slice past
+        # the end truncates rather than raising, so the kernels got a slot table
+        # shorter than their own grid and read past it"
+        # (`dspark_proposer.py`). The widened rows are inert -- the V4 bridge
+        # fills their ring slot with 0 and their seq_len with 0.
+        num_reqs_padded = max(num_reqs_padded, block_bs)
+
+        md = original(
+            self, num_reqs, num_reqs_padded, num_tokens_padded, *args, **kwargs
+        )
+        # ...and then keep those inert rows from scattering into slot 0.
+        prepare(num_reqs, block_bs)
+        return md
+
+    wrapped_build_draft_attn_metadata._atom_dspark_block_padding_patched = True
+    DSparkSpeculator._build_draft_attn_metadata = wrapped_build_draft_attn_metadata
+    logger.info(
+        "ATOM plugin: sentinelling the DSpark draft's cudagraph-padded block "
+        "tail outside the graph replay."
+    )
+
+
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
     _patch_dspark_fused_markov_sample()
+    _patch_dspark_draft_block_padding()
+    _patch_dspark_markov_embed_bounds()
     _patch_vllm_dspark_dcp_inputs()
     _patch_vllm_llm_base_model_sharing()
+    _patch_dspark_draft_sharing()
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()
     _patch_vllm_deepseek_v4_mtp_first_pass_inputs()
@@ -690,7 +1000,7 @@ def apply_vllm_spec_decode_patch() -> None:
                 dict.fromkeys((*allowed, *atom_allowed_attn_types))
             )
 
-    setattr(wrapped_init, "_atom_allowed_attn_types_patched", True)
+    wrapped_init._atom_allowed_attn_types_patched = True
     SpecDecodeBaseProposer.__init__ = wrapped_init
 
     logger.info(

@@ -40,6 +40,13 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     ),
     # vLLM registers this arch too, but only to its NVIDIA implementation.
     "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkVllm",
+    # vLLM ships an AMD DSpark drafter for V4, so this override is not about
+    # coverage -- it is about acceptance. vLLM's loses ~1.4x of conc-128
+    # throughput as the decode batch grows where ATOM's holds; see
+    # `models/deepseek_v4_dspark.py` for the measurements and what was ruled out.
+    "DSparkDraftModel": (
+        "atom.plugin.vllm.models.deepseek_v4_dspark:DeepseekV4DSparkVllm"
+    ),
     "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
@@ -302,6 +309,18 @@ def register_model() -> None:
 
     apply_vllm_v4_block_reuse_patch()
 
+    # If vLLM memoized `current_platform` before our plugin resolved,
+    # ATOMPlatform is not live and its config hook never runs. Re-attach it here
+    # -- this runs from `create_engine_config()`, before vLLM calls the hook.
+    from atom.plugin.vllm.platform import install_platform_config_hook
+
+    install_platform_config_hook()
+
+    # Late-run the registrations `register_platform()` may have aborted on:
+    # `vllm.model_executor` can still be half-imported at that point.
+    _register_hf_configs()
+    _register_mxfp8_quantization_config()
+
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()
@@ -388,3 +407,13 @@ def register_model() -> None:
     )
 
     apply_vllm_req_id_passthrough_patch()
+
+    # DeepSeek-V4 cudagraph-profiling KV-cache floor. Also installed here
+    # because mp workers only run the platform hook when a VllmConfig is
+    # (re)constructed in their process; without it an unpatched worker dies in
+    # profile_cudagraph_memory. No-ops for non-V4 models.
+    from atom.plugin.vllm.deepseek_v4_profiling_patch import (
+        apply_vllm_v4_profiling_min_blocks_patch,
+    )
+
+    apply_vllm_v4_profiling_min_blocks_patch()

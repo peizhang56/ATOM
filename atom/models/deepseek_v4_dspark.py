@@ -731,6 +731,19 @@ class DSparkLayer(Block):  # type: ignore[misc]
         B = fc.context.scheduled_bs
         cu_seqlens_q = attn_md.cu_seqlens_q[: B + 1]
         a = self.attn
+        # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set. Stage 0 only:
+        # every stage writes the same (slot, position) pairs into its own plane,
+        # so one stage's stamps describe them all.
+        if self.stage_id == 0:
+            from atom.models.dspark_window_audit import note_writes
+
+            note_writes(
+                a.swa_window,
+                attn_md.state_slot_out[:B],
+                cu_seqlens_q,
+                positions,
+                self.write_per_batch,
+            )
         # An fp8 window is the planes' own 2buff layout, so the verified target
         # KV is quantized for real on its way in and scattered across both
         # planes, exactly as the draft block's own KV is by the fused quant in
@@ -844,7 +857,30 @@ class DSparkLayer(Block):  # type: ignore[misc]
             # accessor (lazy); `bufs.views` raises if stage 0 did not fill first.
             bufs = self.index_buffers(T, W, x.device)
             if self.stage_id == 0:
+                # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set. THIS
+                # is the address a FULL cudagraph bakes into the replayed index
+                # kernel, because this Python runs at capture and never again.
+                # It has to match the buffer the per-step metadata build keeps
+                # refreshing, or the draft gathers its window through a slot
+                # table nobody is updating.
+                from atom.models.dspark_window_audit import (
+                    note_build,
+                    note_metadata_pointer,
+                )
+
+                note_metadata_pointer("DRAFT-READS", slots, True)
+                # Counts the steps this Python actually runs. Under a FULL
+                # replay it does not, so comparing this against the metadata
+                # build count says how much of a run was really replayed --
+                # which is the difference between "capture is fine at small
+                # batch" and "small batch never got captured".
+                note_build(f"dspark_attention-python B={B}")
                 bufs.build(a.swa_window, slots, positions, a.n_local_heads)
+                # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set: how
+                # much of the window `build` just claimed was ever written.
+                from atom.models.dspark_window_audit import note_reads
+
+                note_reads(a.swa_window, slots, positions, W)
             kv_indices, kv_indptr, draft_rows = bufs.views(B)
             batch_ids = bufs.batch_ids[: B * T]
 
@@ -1292,6 +1328,16 @@ class _DSparkInner(nn.Module):
         `forward`.
         """
         if self._index_bufs is None:
+            # Diagnostic, off unless ATOM_DSPARK_WINDOW_AUDIT is set. WHERE this
+            # allocation happens decides whether the bundle is ordinary memory
+            # or the cudagraph pool's: a `torch.empty` issued while a capture is
+            # open belongs to that graph's private pool, which other captures
+            # may reuse and which `mask_pad_tail` then writes to from OUTSIDE
+            # any replay. The lazy-alloc note above reasons about Dynamo
+            # tracing, which is a different hazard.
+            from atom.models.dspark_window_audit import note_alloc_site
+
+            note_alloc_site("DSparkIndexBuffers")
             self._index_bufs = DSparkIndexBuffers.allocate(
                 self._max_num_seqs, draft, window, device
             )
