@@ -1707,8 +1707,32 @@ def build_atom_v4_attention_metadata(
         else:
             pos_np = np.zeros(0, dtype=np.int32)
         visible_np = np.zeros(T_pad, dtype=np.int32)
+        owned_np = None
         if total:
             visible_np[:total] = visible_csa(pos_np).astype(np.int32)
+            # DP attention: an unowned row scores NO context. This tensor is
+            # the ONLY bound on the captured decode indexer -- both
+            # `deepgemm_fp8_paged_mqa_logits` and `top_k_per_row_decode` touch
+            # exactly `[0, n_committed)` per row -- so zeroing it here is what
+            # removes the per-request index-plane read that DP attention
+            # exists to remove. Step 2b masked only the main attention's
+            # gather (see `_populate_decode_persistent`) and left this scan at
+            # full width, which is why it cost 38% and bought nothing.
+            #
+            # Zero is the value pad rows already carry, so it is a tested
+            # input rather than a new one: "a zero end contributes no CTA"
+            # (`deepseek_v4_attn.py`). The row's `topk_local` is then left
+            # uninitialised, which is safe only because the same mask gives
+            # the row a zero-length CSA range downstream, so nothing reads it.
+            owned_np = _v4_dp_owned_token_mask(batch_np, physical_slot_arr)
+            if owned_np is not None:
+                visible_np[:total] = np.where(owned_np, visible_np[:total], 0)
+            # Timing diagnostic; inert at 100. See `_v4_index_scan_percent`.
+            _pct = _v4_index_scan_percent()
+            if _pct != 100:
+                visible_np[:total] = (
+                    visible_np[:total].astype(np.int64) * _pct // 100
+                ).astype(np.int32)
         md.csa_n_committed_per_token = bufs.stage(
             bufs.csa_n_committed_per_token, visible_np
         )
@@ -1730,6 +1754,7 @@ def build_atom_v4_attention_metadata(
             total,
             T_pad,
             positions,
+            owned_np=owned_np,
         )
         # Decode indexer (CUDAGraph-friendly path) reads only the per-seq
         # committed count; the prefill-only fields stay unset.
@@ -1878,7 +1903,63 @@ def _v4_dp_attention_enabled() -> bool:
     return os.environ.get("ATOM_VLLM_DP_ATTENTION") == "1"
 
 
-def _populate_decode_persistent(md, common, pos_np, bufs, total, T_pad, positions_gpu):
+def _v4_index_scan_percent() -> int:
+    """TIMING DIAGNOSTIC. Percent of each row's committed CSA context that the
+    decode indexer is allowed to scan. 100 = untouched production behaviour.
+
+    **Below 100 the model's output is WRONG** -- the scorer picks its top-k from
+    a truncated context, so sparse attention then reads the wrong rows. This
+    exists only to price the scan, and it prices it exactly: the scan is the
+    sole consumer of `csa_n_committed_per_token` on the fp8 decode path, so
+    scaling that tensor scales the scan's work and changes nothing else.
+
+    Worth having as a knob rather than a patch because the question it answers
+    -- what fraction of the decode step is the per-request index-plane read --
+    has now been answered wrongly twice from byte counts, and both wrong
+    answers cost a day of implementation each.
+
+    Read from the file named by ``ATOM_V4_INDEX_SCAN_PCT_FILE`` on every
+    metadata build (not from the environment) so one server can measure the
+    A-vs-A control and the ablation without a reboot, which is the only way the
+    two numbers share a KV pool, a prefix cache and a warmed batch.
+    """
+    import os
+
+    path = os.environ.get("ATOM_V4_INDEX_SCAN_PCT_FILE")
+    if not path:
+        return 100
+    try:
+        with open(path) as fh:
+            return max(0, min(100, int(fh.read().strip())))
+    except (OSError, ValueError):
+        return 100
+
+
+def _v4_dp_owned_token_mask(batch_ids_np, state_slot_cpu):
+    """``[total]`` bool over query rows: does this rank own the row's REQUEST?
+
+    ``None`` when DP attention is off or the world is 1, which every caller
+    reads as "shard nothing".
+
+    Ownership is ``state_slot % world_size``. The slot is held from admission to
+    completion, so a request cannot change rank mid-decode (its rolling SWA ring
+    would otherwise follow a different rank between steps), and every rank
+    already agrees on the slot without a further collective.
+    """
+    if not _v4_dp_attention_enabled() or batch_ids_np.size == 0:
+        return None
+    from aiter.dist.parallel_state import get_tp_group as _tpg
+
+    group = _tpg()
+    if group.world_size <= 1:
+        return None
+    slots = np.asarray(state_slot_cpu)
+    return (slots[batch_ids_np] % group.world_size) == group.rank_in_group
+
+
+def _populate_decode_persistent(
+    md, common, pos_np, bufs, total, T_pad, positions_gpu, owned_np=None
+):
     """Decode index/indptr build into persistent fixed-address buffers.
 
     Faithful port of ATOM's ``_attach_v4_paged_decode_meta`` for plugin mode:
@@ -1910,38 +1991,32 @@ def _populate_decode_persistent(md, common, pos_np, bufs, total, T_pad, position
         return out
 
     # DP attention: give the query rows this rank does NOT own zero-length CSR
-    # ranges, so the unchanged decode kernel performs no KV read for them. That
-    # read -- every rank pulling every request's full latent, which MLA does not
-    # shard because the latent is shared across heads -- is the entire cost DP
-    # attention exists to remove.
+    # ranges, so the unchanged decode kernel GATHERS no KV for them.
     #
-    # Only the READ is sharded. Every rank still WRITES every token's KV
+    # This is the SECOND of the two reads a row costs, and on its own it was
+    # never the expensive one -- see the caller, which zeroes those rows'
+    # `csa_n_committed_per_token` and so skips the indexer SCAN. Truncating
+    # the gather while leaving the scan at full width is what made step 2b a
+    # 38% regression rather than a win: the scan is the ~662 MB/request read.
+    # The two must be masked together and from the same mask, which is why it
+    # is built once in the caller and threaded in.
+    #
+    # Only READS are sharded. Every rank still WRITES every token's KV
     # (`dest_rows` below is untouched), because a rank that held only its own
     # requests' blocks would miss a prefix-cache hit against a request that
     # lived on another rank -- which is how vLLM's own data parallelism
     # fragmented this model's cache to 38.9% (kb/e1). Writes are one row per
-    # token; the read is ~662 MB per request at 115k.
-    #
-    # Ownership is `state_slot % world_size`: the slot is held for the
-    # request's lifetime, so the assignment cannot move between steps, and
-    # every rank already agrees on it.
-    if _v4_dp_attention_enabled() and total:
-        from aiter.dist.parallel_state import get_tp_group as _tpg
-
-        _world = _tpg().world_size
-        if _world > 1:
-            _bh = bufs.batch_id.np[:total]
-            _sh = np.asarray(md.state_slot_mapping_cpu)
-            _own = (_sh[_bh] % _world) == _tpg().rank_in_group
-            # ONE entry, not zero. A zero-length range faults the decode
-            # kernel ("Memory access fault ... on address (nil)") -- it does
-            # not guard an empty row. One entry is read instead of up to
-            # `win` + `index_topk`, so the saving is the same to within a
-            # rounding error, and the row's output is discarded by
-            # `_dp_combine` anyway.
-            actual_swa = np.where(_own, actual_swa, 1).astype(np.int32)
-            csa_valid_k = np.where(_own, csa_valid_k, 0).astype(np.int32)
-            n_h_per_token = np.where(_own, n_h_per_token, 0).astype(np.int32)
+    # token.
+    if owned_np is not None:
+        # ONE entry, not zero. A zero-length range faults the decode
+        # kernel ("Memory access fault ... on address (nil)") -- it does
+        # not guard an empty row. One entry is read instead of up to
+        # `win` + `index_topk`, so the saving is the same to within a
+        # rounding error, and the row's output is discarded by
+        # `_dp_combine` anyway.
+        actual_swa = np.where(owned_np, actual_swa, 1).astype(np.int32)
+        csa_valid_k = np.where(owned_np, csa_valid_k, 0).astype(np.int32)
+        n_h_per_token = np.where(owned_np, n_h_per_token, 0).astype(np.int32)
 
     swa_indptr = _indptr(actual_swa)
     csa_indptr = _indptr(actual_swa + csa_valid_k)
